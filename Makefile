@@ -1,5 +1,5 @@
 stress:
-	gcc -o aio-stress aio-stress.c
+	gcc -o aio-stress -laio -lpthread aio-stress.c
 install:
 	cp aio-stress /usr/bin
 uninstall:
