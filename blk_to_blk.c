@@ -1254,7 +1254,7 @@ off_t parse_size(char *size_arg, off_t mult) {
 }
 
 void print_usage(void) {
-    printf("usage: aio-stress [-s size] [-r size] [-a size] [-d num] [-b num]\n");
+    printf("usage: b2b [-s size] [-r size] [-a size] [-d num] [-b num]\n");
     printf("                  [-i num] [-t num] [-c num] [-C size] [-nxhOS ]\n");
     printf("                  file1 [file2 ...]\n");
     printf("\t-a size in KB at which to align buffers\n");
@@ -1291,6 +1291,7 @@ int main(int ac, char **av)
     int rwfd;
     int i;
     int j;
+    int n;
     int c;
 
     off_t file_size = 1 * 1024 * 1024 * 1024;
@@ -1451,9 +1452,15 @@ int main(int ac, char **av)
     fprintf(stderr, "threads %d files %d contexts %d context offset %LuMB verification %s\n", 
             num_threads, num_files, num_contexts, 
 	    context_offset / (1024 * 1024), verify ? "on" : "off");
-    /* open all the files and do any required setup for them */
-    for (i = optind ; i < ac ; i++) {
+    
+    /* open the first two devcie files and do any required setup for them */    
+    for (i = optind, n = 0; i < ac, n < 2 ; i++, n++) {
 	int thread_index;
+	off_t start = 0;
+	off_t end = 0;
+	int rw = READ;
+	if (n = 1)
+	    rw = WRITE;	
 	for (j = 0 ; j < num_contexts ; j++) {
 	    thread_index = open_fds % num_threads;
 	    open_fds++;
@@ -1461,15 +1468,18 @@ int main(int ac, char **av)
 	    rwfd = open(av[i], O_CREAT | O_RDWR | o_direct | o_sync, 0600);
 	    assert(rwfd != -1);
 
-	    oper = create_oper(rwfd, first_stage, j * context_offset, 
-	                       file_size - j * context_offset, rec_len, 
-			       depth, io_iter, av[i]);
+            end = start + ((file_size / rec_len) / num_contexts + 1)*rec_len;	
+            if (j == num_contexts - 1) 
+                end = file_size;                
+
+	    oper = create_oper(rwfd, rw, start, end, rec_len, depth, io_iter, av[i]);
 	    if (!oper) {
 		fprintf(stderr, "error in create_oper\n");
 		exit(-1);
 	    }
 	    oper_list_add(oper, &t[thread_index].active_opers);
 	    t[thread_index].num_files++;
+	    start += end;
 	}
     }
     if (setup_shared_mem(num_threads, num_files * num_contexts, 
