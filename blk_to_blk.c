@@ -36,6 +36,7 @@
 
 #define IO_FREE 0
 #define IO_PENDING 1
+#define IO_PENDING_WRITE 2
 #define RUN_FOREVER -1
 
 #ifndef O_DIRECT
@@ -192,6 +193,9 @@ struct thread_info {
 
     /* list of io units available for io */
     struct io_unit *free_ious;
+
+    /* list of io units available for write io */
+    struct io_unit *ready_write_ious;
 
     /* number of io units in the ios array */
     int num_global_ios;
@@ -426,17 +430,24 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
 
     calc_latency(&io->io_start_time, tv_now, &t->io_completion_latency);
     io->res = result;
-    io->busy = IO_FREE;
-    io->next = t->free_ious;
-    t->free_ious = io;
-    oper->num_pending--;
-    t->num_global_pending--;
-    check_finished_io(io);
-    if (oper->num_pending == 0 && 
-       (oper->started_ios == oper->total_ios || oper->stonewalled)) 
-    {
-        print_time(oper);
-    } 
+    if (io->busy == IO_PENDING_WRITE) {
+        io->busy = IO_FREE;
+        io->next = t->free_ious;
+        t->free_ious = io;
+        oper->num_pending--;
+        t->num_global_pending--;
+        check_finished_io(io);
+        if (oper->num_pending == 0 && 
+        (oper->started_ios == oper->total_ios || oper->stonewalled)) {
+                print_time(oper);
+        } 
+    } else {
+        io->busy = IO_PENDING_WRITE;
+        io->next = t->ready_write_ious;
+        t->ready_write_ious = io;
+    }
+        
+
 }
 
 int read_some_events(struct thread_info *t) {
@@ -564,6 +575,22 @@ off_t random_byte_offset(struct io_oper *oper) {
     return rand_byte;
 }
 
+static struct io_unit *build_write_iocb(struct thread_info *t, struct io_oper *oper)
+{
+    struct io_unit *io;
+
+    if (t->ready_write_ious) {
+        io = t->ready_write_ious;
+	t->ready_write_ious = t->ready_write_ious->next;
+    } else
+        return NULL;
+    
+    io_prep_pwrite(&io->iocb,oper->fd, io->buf, oper->reclen, 
+               oper->last_offset);
+
+    return io;
+}
+
 /* 
  * build an aio iocb for an operation, based on oper->rw and the
  * last offset used.  This finds the struct io_unit that will be attached
@@ -681,11 +708,14 @@ int build_oper(struct thread_info *t, struct io_oper *oper, int num_ios,
         num_ios = oper->total_ios - oper->started_ios;   
 
     for( i = 0 ; i < num_ios ; i++) {
-	io = build_iocb(t, oper);
-	if (!io) {
-	    return -1;    
-	}
-	my_iocbs[i] = &io->iocb;
+        io = build_write_iocb(t, oper);
+        if (!io) {
+        	io = build_iocb(t, oper);
+        	if (!io) {
+        	    return -1;    
+        	}
+        }
+        my_iocbs[i] = &io->iocb;
     }
     return num_ios;
 }
