@@ -839,7 +839,7 @@ static int oper_runnable(struct io_oper *oper) {
     ret = fstat(oper->fd, &buf);
     if (ret < 0) {
         perror("fstat");
-    exit(1);
+        exit(1);
     }
     if (S_ISREG(buf.st_mode) && buf.st_size < oper->start)
         return 0;
@@ -1307,8 +1307,8 @@ int main(int ac, char **av)
     int i;
     int j;
     int c;
+    off_t file_size;
 
-    unsigned long long file_size = 16 * (unsigned long long)(1024 * 1024) * (unsigned long long)1024;
     int first_stage = WRITE;
     struct io_oper *oper;
     int status = 0;
@@ -1333,9 +1333,6 @@ int main(int ac, char **av)
             break;
         case 'b':
             max_io_submit = atoi(optarg);
-            break;
-        case 's':
-            file_size = parse_size(optarg, 1024 * 1024);
             break;
         case 'd':
             depth = atoi(optarg);
@@ -1444,7 +1441,7 @@ int main(int ac, char **av)
         stages = 1 << READ;
     } 
 
-    fprintf(stderr, "file size %LuMB, record size %luKB, depth %d, ios per iteration %d\n", file_size / (1024 * 1024), rec_len / 1024, depth, io_iter);
+    fprintf(stderr, "record size %luKB, depth %d, ios per iteration %d\n", rec_len / 1024, depth, io_iter);
     fprintf(stderr, "max io_submit %d, buffer alignment set to %luKB\n", 
             max_io_submit, (page_size_mask + 1)/1024);
     fprintf(stderr, "threads %d files %d contexts %d verification %s\n", 
@@ -1456,6 +1453,10 @@ int main(int ac, char **av)
             off_t delta = 0;
             off_t start = 0;
             off_t end = 0;
+            int ret = 0;
+            struct stat s;
+            struct stat s1;
+            
             thread_index = open_fds % num_threads;
             open_fds++;
 
@@ -1465,11 +1466,36 @@ int main(int ac, char **av)
             rwfd1 = open(av[i+1], O_CREAT | O_RDWR | o_direct | o_sync, 0600);
             assert(rwfd1 != -1);
 
-            delta = file_size/num_contexts;
+            ret = fstat(rwfd, &s);
+            if (ret < 0) {
+                perror("fstat");
+                exit(1);
+            }
+            ret = fstat(rwfd1, &s1);
+            if (ret < 0) {
+                perror("fstat");
+                exit(1);
+            }
+
+            if ()
+            
+            if (s.st_size > s1.st_size)
+                file_size = s1.st_size;
+            else
+                file_size = s.st_size;
+           
+            delta = (file_size+rec_len*num_contexts-1)/(rec_len*num_contexts);
+            delta *= rec_len*num_contexts;
+            
             start = j * delta;
             end = start + delta;
             if (end > file_size)
                 end = file_size;
+            
+             fprintf(stderr, "start %llu, end %llu, file_size %LuMB, %s size %LuMB, %s size %LuMB\n", 
+                start, end, file_size/(1024*1024),
+                av[i], s.st_size/(1024*1024), 
+                av[i+1], s1.st_size/(1024*1024));
             
             oper = create_oper(rwfd, rwfd1, first_stage, start, end, rec_len, 
                        depth, io_iter, av[i], av[i+1]);
