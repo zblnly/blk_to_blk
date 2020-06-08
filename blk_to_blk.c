@@ -17,6 +17,10 @@
 #define PROG_VERSION "0.01"
 #define NEW_GETEVENTS
 
+#define _LARGEFILE_SOURCE
+#define _LARGEFILE64_SOURCE
+#define _FILE_OFFSET_BITS 64 
+
 #include <stdio.h>
 #include <errno.h>
 #include <assert.h>
@@ -1300,6 +1304,31 @@ void print_usage(void) {
     printf("version %s\n", PROG_VERSION);
 }
 
+off_t get_file_size(int fd)
+{
+    int ret = 0;
+    off_t filesize = 0;
+    struct stat s;
+    ret = fstat(fd, &s);
+    if (ret < 0) {        
+        return 0;
+    }
+    if (S_ISBLK(s.st_mode)) {
+        filesize = lseek64(fd, 0, SEEK_END);
+        if (-1 == filesize) {
+            fprintf(stderr,
+                "Error while opening %llu : %s\n",
+                filesize, strerror(errno));
+            return 0;
+        }
+        //fprintf(stderr, "filesize %llu(%llx) s.st_size:%llx\n", 
+            //filesize, filesize, s.st_size);        
+    } else if (S_ISREG(s.st_mode)) {
+        filesize = s.st_size;
+    }
+    return filesize;
+}
+
 int main(int ac, char **av) 
 {
     int rwfd;
@@ -1452,37 +1481,30 @@ int main(int ac, char **av)
         for (j = 0 ; j < num_contexts ; j++) {
             off_t delta = 0;
             off_t start = 0;
+            off_t filesize0 = 0;
+            off_t filesize1 = 0;
             off_t end = 0;
-            int ret = 0;
-            struct stat s;
-            struct stat s1;
-            
+                    
             thread_index = open_fds % num_threads;
             open_fds++;
 
-            rwfd = open(av[i], O_CREAT | O_RDWR | o_direct | o_sync, 0600);
+            rwfd = open(av[i], O_CREAT | O_RDWR | O_LARGEFILE | o_direct | o_sync , 0600);
             assert(rwfd != -1);
 
-            rwfd1 = open(av[i+1], O_CREAT | O_RDWR | o_direct | o_sync, 0600);
+            rwfd1 = open(av[i+1], O_CREAT | O_RDWR | O_LARGEFILE | o_direct | o_sync, 0600);
             assert(rwfd1 != -1);
 
-            ret = fstat(rwfd, &s);
-            if (ret < 0) {
-                perror("fstat");
-                exit(1);
+            filesize0 = get_file_size(rwfd);
+            filesize1 = get_file_size(rwfd1);    
+            if (!filesize0 || !filesize1) {
+                fprintf(stderr, "filesize0 or filesize1 is 0!\n");
+                exit(-1);
             }
-            ret = fstat(rwfd1, &s1);
-            if (ret < 0) {
-                perror("fstat");
-                exit(1);
-            }
-
-            if ()
-            
-            if (s.st_size > s1.st_size)
-                file_size = s1.st_size;
+       
+            if (filesize0 > filesize1)
+                file_size = filesize1;
             else
-                file_size = s.st_size;
+                file_size = filesize0;
            
             delta = (file_size+rec_len*num_contexts-1)/(rec_len*num_contexts);
             delta *= rec_len*num_contexts;
@@ -1494,8 +1516,8 @@ int main(int ac, char **av)
             
              fprintf(stderr, "start %llu, end %llu, file_size %LuMB, %s size %LuMB, %s size %LuMB\n", 
                 start, end, file_size/(1024*1024),
-                av[i], s.st_size/(1024*1024), 
-                av[i+1], s1.st_size/(1024*1024));
+                av[i], filesize0/(1024*1024), 
+                av[i+1], filesize1/(1024*1024));
             
             oper = create_oper(rwfd, rwfd1, first_stage, start, end, rec_len, 
                        depth, io_iter, av[i], av[i+1]);
