@@ -197,6 +197,8 @@ struct io_unit {
 
     off_t offset;
 
+    int len;
+
     struct io_unit *next;
 
     struct timeval io_start_time;       /* time of io_submit */
@@ -417,8 +419,8 @@ static void print_lat(char *str, struct io_latency *lat) {
             str, lat->min, avg, lat->max);
 
     for (i = 0 ; i < DEVIATIONS ; i++) {
-    fprintf(stderr, " %.0f < %d", lat->deviations[i], deviations[i]);
-    total_counted += lat->deviations[i];
+        fprintf(stderr, " %.0f < %d", lat->deviations[i], deviations[i]);
+        total_counted += lat->deviations[i];
     }
     if (total_counted && lat->total_io - total_counted)
         fprintf(stderr, " < %.0f", lat->total_io - total_counted);
@@ -458,19 +460,18 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
         t->num_global_pending--;
         oper->num_pending_write--;
         check_finished_io(io);
-        if (oper->num_pending == 0 && 
-            (oper->started_ios == oper->total_ios || oper->stonewalled)) {
+        if (!oper->num_pending && (oper->started_ios == oper->total_ios || oper->stonewalled)) {
             print_time(oper);
         } 
     } else if (io->busy == IO_PENDING) {
         io->busy = IO_PENDING_WRITE;
         io->next = t->ready_write_ious;
         t->ready_write_ious = io;
-        oper->num_pending--;
+        //oper->num_pending--;
         t->num_global_pending--;
         oper->num_pending_read--;
         if (ZBDEBUG && 0) 
-                fprintf(stderr, "finish_io io->busy:%d 2\n", io->busy);
+            fprintf(stderr, "finish_io io->busy:%d 2\n", io->busy);
     } else {
         fprintf(stderr, "error io->busy:%d\n", io->busy);
     }       
@@ -515,6 +516,9 @@ static struct io_unit *find_iou(struct thread_info *t, struct io_oper *oper)
     int nr;
 
 retry:
+    if (oper->started_ios == oper->total_ios && !oper->num_pending) {
+        return NULL;
+    } 
 
     if (t->ready_write_ious) {
         event_io = t->ready_write_ious;
@@ -528,15 +532,16 @@ retry:
         event_io->io_oper = oper;
         return event_io;
     }
-    
-    if (t->free_ious) {
-        event_io = t->free_ious;
-        t->free_ious = t->free_ious->next;
-        if (grab_iou(event_io, oper)) {
-            fprintf(stderr, "io unit on free list but not free\n");
-            abort();
+    if (oper->started_ios < oper->total_ios) {
+        if (t->free_ious) {
+            event_io = t->free_ious;
+            t->free_ious = t->free_ious->next;
+            if (grab_iou(event_io, oper)) {
+                fprintf(stderr, "io unit on free list but not free\n");
+                abort();
+            }
+            return event_io;
         }
-        return event_io;
     }
     if (ZBDEBUG && 0) 
         fprintf(stderr, "find_iou will read_some_events\n");
@@ -632,20 +637,22 @@ static struct io_unit *build_iocb(struct thread_info *t, struct io_oper *oper)
 
     io = find_iou(t, oper);
     if (!io) {
-        fprintf(stderr, "unable to find io unit\n");
+        //fprintf(stderr, "unable to find io unit\n");
         return NULL;
     }
     
     if (io->busy == IO_PENDING_WRITE_SUBMIT) {
-        io_prep_pwrite(&io->iocb, oper->fd1, io->buf, oper->reclen, 
-            io->offset);
+        io_prep_pwrite(&io->iocb, oper->fd1, io->buf, io->len, io->offset);
         if (ZBDEBUG && 0) 
             fprintf(stderr, "write build_oper: io->offset %llu\n", io->offset);
     } else {
         io->offset = oper->last_offset;
-        io_prep_pread(&io->iocb, oper->fd, io->buf, oper->reclen, 
-            io->offset);
-        oper->last_offset += oper->reclen;
+        if (io->offset + oper->reclen > oper->end)
+            io->len = oper->end - io->offset;   
+        else
+            io->len = oper->reclen;
+        io_prep_pread(&io->iocb, oper->fd, io->buf, io->len, io->offset);
+        oper->last_offset += io->len;
         if (ZBDEBUG && 0) 
             fprintf(stderr, "read build_oper: io->offset %llu\n", io->offset);
     }
@@ -684,8 +691,8 @@ create_oper(int fd, int fd1, int rw, off_t start, off_t end, int reclen, int dep
 
     oper = malloc (sizeof(*oper));
     if (!oper) {
-    fprintf(stderr, "unable to allocate io oper\n");
-    return NULL;
+        fprintf(stderr, "unable to allocate io oper\n");
+        return NULL;
     }
     memset(oper, 0, sizeof(*oper));
 
@@ -697,7 +704,7 @@ create_oper(int fd, int fd1, int rw, off_t start, off_t end, int reclen, int dep
     oper->fd1 = fd1;
     oper->reclen = reclen;
     oper->rw = rw;
-    oper->total_ios = (oper->end - oper->start) / oper->reclen;
+    oper->total_ios = (oper->end - oper->start + oper->reclen - 1) / oper->reclen;
     oper->file_name = file_name;
     oper->file_name1 = file_name1;
 
@@ -716,13 +723,7 @@ int build_oper(struct thread_info *t, struct io_oper *oper, int num_ios,
 
     if (oper->started_ios == 0)
         gettimeofday(&oper->start_time, NULL);
-
-    if (num_ios == 0)
-        num_ios = oper->total_ios;
-
-    if ((oper->started_ios + num_ios) > oper->total_ios)
-        num_ios = oper->total_ios - oper->started_ios;   
-
+    
     if (ZBDEBUG && 0) 
         fprintf(stderr, "build_oper: num_ios %d\n", num_ios);
     
@@ -730,7 +731,7 @@ int build_oper(struct thread_info *t, struct io_oper *oper, int num_ios,
         io = build_iocb(t, oper);
         if (!io) 
                 return -1;
-            my_iocbs[i] = &io->iocb;
+        my_iocbs[i] = &io->iocb;
     }
     return num_ios;
 }
@@ -745,19 +746,19 @@ static void update_iou_counters(struct iocb **my_iocbs, int nr,
     struct io_unit *io;
     int i;
     for (i = 0 ; i < nr ; i++) {
-        io = (struct io_unit *)(my_iocbs[i]);
-        io->io_oper->num_pending++;
+        io = (struct io_unit *)(my_iocbs[i]);       
         
         if (io->busy == IO_PENDING) {
+            io->io_oper->num_pending++;
             io->io_oper->started_ios++;
             io->io_oper->num_pending_read++;
+            io->io_start_time = *tv_now;    /* set time of io_submit */
         } else if (io->busy == IO_PENDING_WRITE_SUBMIT) {
             io->io_oper->num_pending_write++;
         } else {
             fprintf(stderr, "io->busy %d is error\n", io->busy);
             exit(1);
-        }            
-        io->io_start_time = *tv_now;    /* set time of io_submit */
+        } 
     }
 }
 
@@ -788,13 +789,13 @@ resubmit:
          */
         if (ret > 0 || ret == -EAGAIN) {
             int old_ret = ret;
-                if (ZBDEBUG && 1) 
-                    fprintf(stderr, "run_built will read_some_events\n");
+            if (ZBDEBUG && 1) 
+                fprintf(stderr, "run_built will read_some_events\n");
             if ((ret = read_some_events(t) > 0)) {
-            goto resubmit;
+                goto resubmit;
             } else {
                 fprintf(stderr, "ret was %d and now is %d\n", ret, old_ret);
-            abort();
+                abort();
             }
         }
 
@@ -890,15 +891,27 @@ static int run_active_list(struct thread_info *t,
     int ret = 0;
     int num_built = 0;
     int rw = READ;
-
+    
     oper = t->active_opers;
     while(oper) {
+        if (ZBDEBUG && 0) 
+            fprintf(stderr, "id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
+                t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
+                oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
         if (!oper_runnable(oper)) {
             oper = oper->next;
+            if (ZBDEBUG && 1) 
+                fprintf(stderr, "oper_runnable is 0\n");
             if (oper == t->active_opers)
                 break;
             continue;
         }
+        
+        if ((oper->started_ios == oper->total_ios) && (!oper->num_pending_read) &&
+            oper->num_pending && (oper->num_pending == oper->num_pending_write)) {
+            read_some_events(t);
+        } 
+        
         ret = build_oper(t, oper, io_iter, my_iocbs);
         if (ret >= 0) {
             my_iocbs += ret;
@@ -908,8 +921,13 @@ static int run_active_list(struct thread_info *t,
             oper = t->active_opers;
             if (num_built + io_iter > max_io_submit)
                 break;
-        } else
+        } else {
+            if (oper->started_ios == oper->total_ios && !oper->num_pending) {
+                oper_list_del(oper, &t->active_opers);
+                oper_list_add(oper, &t->finished_opers);         
+            } 
             break;
+        }
     }
     if (num_built) {
         ret = run_built(t, num_built, t->iocbs);
@@ -921,12 +939,13 @@ static int run_active_list(struct thread_info *t,
             oper = built_opers;
             oper_list_del(oper, &built_opers);
             oper_list_add(oper, &t->active_opers);
-            if (oper->started_ios == oper->total_ios) {
+            if (oper->started_ios == oper->total_ios && !oper->num_pending) {
                 oper_list_del(oper, &t->active_opers);
                 oper_list_add(oper, &t->finished_opers);
             }
         }
     }
+
     return 0;
 }
 
@@ -963,21 +982,21 @@ int setup_ious(struct thread_info *t,
 
     t->ios = malloc(bytes);
     if (!t->ios) {
-    fprintf(stderr, "unable to allocate io units\n");
-    return -1;
+        fprintf(stderr, "unable to allocate io units\n");
+        return -1;
     }
     memset(t->ios, 0, bytes);
 
     for (i = 0 ; i < depth * num_files; i++) {
-    t->ios[i].buf = aligned_buffer;
-    aligned_buffer += padded_reclen;
-    t->ios[i].buf_size = reclen;
-    if (verify)
-        memset(t->ios[i].buf, 'b', reclen);
-    else
-        memset(t->ios[i].buf, 0, reclen);
-    t->ios[i].next = t->free_ious;
-    t->free_ious = t->ios + i;
+        t->ios[i].buf = aligned_buffer;
+        aligned_buffer += padded_reclen;
+        t->ios[i].buf_size = reclen;
+        if (verify)
+            memset(t->ios[i].buf, 'b', reclen);
+        else
+            memset(t->ios[i].buf, 0, reclen);
+        t->ios[i].next = t->free_ious;
+        t->free_ious = t->ios + i;
     }
     if (verify) {
         verify_buf = aligned_buffer;
@@ -987,7 +1006,7 @@ int setup_ious(struct thread_info *t,
     t->iocbs = malloc(sizeof(struct iocb *) * max_io_submit);
     if (!t->iocbs) {
         fprintf(stderr, "unable to allocate iocbs\n");
-    goto free_buffers;
+        goto free_buffers;
     }
 
     memset(t->iocbs, 0, max_io_submit * sizeof(struct iocb *));
@@ -1033,45 +1052,45 @@ int setup_shared_mem(int num_threads, int num_files, int depth,
         total_ram += padded_reclen;
 
     if (use_shm == USE_MALLOC) {
-    p = malloc(total_ram + page_size_mask);
+        p = malloc(total_ram + page_size_mask);
     } else if (use_shm == USE_SHM) {
         shm_id = shmget(IPC_PRIVATE, total_ram, IPC_CREAT | 0700);
-    if (shm_id < 0) {
-        perror("shmget");
+        if (shm_id < 0) {
+            perror("shmget");
+            drop_shm();
+            goto free_buffers;
+        }
+        p = shmat(shm_id, (char *)0x50000000, 0);
+            if ((long)p == -1) {
+            perror("shmat");
+            goto free_buffers;
+        }
+        /* won't really be dropped until we shmdt */
         drop_shm();
-        goto free_buffers;
-    }
-    p = shmat(shm_id, (char *)0x50000000, 0);
-        if ((long)p == -1) {
-        perror("shmat");
-        goto free_buffers;
-    }
-    /* won't really be dropped until we shmdt */
-    drop_shm();
     } else if (use_shm == USE_SHMFS) {
         char mmap_name[16]; /* /dev/shm/ + null + XXXXXX */    
-    int fd;
+        int fd;
 
-    strcpy(mmap_name, "/dev/shm/XXXXXX");
-    fd = mkstemp(mmap_name);
-        if (fd < 0) {
-        perror("mkstemp");
-        goto free_buffers;
-    }
-    unlink(mmap_name);
-    ftruncate(fd, total_ram);
-    shm_id = fd;
-    p = mmap((char *)0x50000000, total_ram,
-             PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        strcpy(mmap_name, "/dev/shm/XXXXXX");
+        fd = mkstemp(mmap_name);
+            if (fd < 0) {
+            perror("mkstemp");
+            goto free_buffers;
+        }
+        unlink(mmap_name);
+        ftruncate(fd, total_ram);
+        shm_id = fd;
+        p = mmap((char *)0x50000000, total_ram,
+                 PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
         if (p == MAP_FAILED) {
-        perror("mmap");
-        goto free_buffers;
-    }
+            perror("mmap");
+            goto free_buffers;
+        }
     }
     if (!p) {
         fprintf(stderr, "unable to allocate buffers\n");
-    goto free_buffers;
+        goto free_buffers;
     }
     unaligned_buffer = p;
     p = (char*)((intptr_t) (p + page_size_mask) & ~page_size_mask);
@@ -1089,7 +1108,7 @@ free_buffers:
  * runs through all the thread_info structs and calculates a combined
  * throughput
  */
-void global_thread_throughput(struct thread_info *t, char *this_stage) {
+void global_thread_throughput(struct thread_info *t) {
     int i;
     double runtime = time_since_now(&global_stage_start_time);
     double total_mb = 0;
@@ -1101,11 +1120,11 @@ void global_thread_throughput(struct thread_info *t, char *this_stage) {
         min_trans = t->stage_mb_trans;
     }
     if (total_mb) {
-    fprintf(stderr, "%s throughput (%.2f MB/s) ", this_stage,
-            total_mb / runtime);
-    fprintf(stderr, "%.2f MB in %.2fs", total_mb, runtime);
+        fprintf(stderr, "throughput (%.2f MB/s) ", 
+                total_mb / runtime);
+        fprintf(stderr, "%.2f MB in %.2fs", total_mb, runtime);
         if (stonewall)
-        fprintf(stderr, " min transfer %.2fMB", min_trans);
+            fprintf(stderr, " min transfer %.2fMB", min_trans);
         fprintf(stderr, "\n");
     }
 }
@@ -1183,15 +1202,10 @@ restart:
      */
     oper = t->finished_opers;
     while(oper) {
-    if (fsync_stages)
-        fsync(oper->fd);
-        t->stage_mb_trans += oper_mb_trans(oper);
-        if (restart_oper(oper)) {
-            oper_list_del(oper, &t->finished_opers);
-            oper_list_add(oper, &t->active_opers);
-            oper = t->finished_opers;
-            continue;
+        if (fsync_stages) {
+            fsync(oper->fd1);
         }
+        t->stage_mb_trans += oper_mb_trans(oper);        
         oper = oper->next;
         if (oper == t->finished_opers)
             break;
@@ -1199,8 +1213,8 @@ restart:
 
     if (t->stage_mb_trans && t->num_files > 0) {
         double seconds = time_since_now(&stage_time);
-        fprintf(stderr, "thread %d %s totals (%.2f MB/s) %.2f MB in %.2fs\n", 
-            t - global_thread_info, this_stage, t->stage_mb_trans/seconds, 
+        fprintf(stderr, "thread %d read/write totals (%.2f MB/s) %.2f MB in %.2fs\n", 
+            t - global_thread_info, t->stage_mb_trans/seconds, 
         t->stage_mb_trans, seconds);
     }
 
@@ -1210,7 +1224,7 @@ restart:
         if (threads_ending == num_threads) {
             threads_starting = 0;
             pthread_cond_broadcast(&stage_cond);
-            global_thread_throughput(t, this_stage);
+            global_thread_throughput(t);
     }
     while(threads_ending != num_threads)
         pthread_cond_wait(&stage_cond, &stage_mutex);
@@ -1247,17 +1261,17 @@ int run_workers(struct thread_info *t, int num_threads)
 
     for(i = 0 ; i < num_threads ; i++) {
         ret = pthread_create(&t[i].tid, NULL, (start_routine)worker, t + i);
-    if (ret) {
-        perror("pthread_create");
-        exit(1);
-    }
+        if (ret) {
+            perror("pthread_create");
+            exit(1);
+        }
     }
     for(i = 0 ; i < num_threads ; i++) {
         ret = pthread_join(t[i].tid, (void *)&thread_ret);
         if (ret) {
-        perror("pthread_join");
-        exit(1);
-    }
+            perror("pthread_join");
+            exit(1);
+        }
     }
     return 0;
 }
@@ -1357,7 +1371,7 @@ int main(int ac, char **av)
     int c;
     off_t file_size;
 
-    int first_stage = WRITE;
+    int first_stage = READ;
     struct io_oper *oper;
     int status = 0;
     int num_files = 0;
@@ -1485,9 +1499,7 @@ int main(int ac, char **av)
         fprintf(stderr, "dropping io_iter to %d\n", io_iter);
     }
 
-    if (!stages) {        
-        stages = 1 << READ;
-    } 
+    stages = READ;    
 
     fprintf(stderr, "record size %luKB, depth %d, ios per iteration %d\n", rec_len / 1024, depth, io_iter);
     fprintf(stderr, "max io_submit %d, buffer alignment set to %luKB\n", 
@@ -1525,12 +1537,12 @@ int main(int ac, char **av)
             else
                 file_size = filesize0;
            
-            delta = (file_size+rec_len*num_contexts-1)/(rec_len*num_contexts);
-            delta *= rec_len*num_contexts;
-            
+            delta = (file_size+rec_len-1)/(rec_len);
+            delta = delta*rec_len/num_contexts;
+
             start = j * delta;
             end = start + delta;
-            if (end > file_size)
+            if (j == num_contexts - 1)
                 end = file_size;
             
              fprintf(stderr, "start %llu, end %llu, file_size %LuMB, %s size %LuMB, %s size %LuMB\n", 
@@ -1556,7 +1568,7 @@ int main(int ac, char **av)
         if (setup_ious(&t[i], t[i].num_files, depth, rec_len, max_io_submit))
             exit(1);
     }
-    if (num_threads > 1){
+    if (num_threads > 1) {
         printf("Running multi thread version num_threads:%d\n", num_threads);
         run_workers(t, num_threads);
     } else {
