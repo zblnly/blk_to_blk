@@ -138,6 +138,12 @@ struct io_oper {
     /* current number of pending requests */
     int num_pending;
 
+    /* current number of pending read requests */
+    int num_pending_read;
+
+    /* current number of pending write requests */
+    int num_pending_write;
+
     /* last error, zero if there were none */
     int last_err;
 
@@ -450,15 +456,19 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
         t->free_ious = io;
         oper->num_pending--;
         t->num_global_pending--;
+        oper->num_pending_write--;
         check_finished_io(io);
         if (oper->num_pending == 0 && 
             (oper->started_ios == oper->total_ios || oper->stonewalled)) {
-                print_time(oper);
+            print_time(oper);
         } 
     } else if (io->busy == IO_PENDING) {
         io->busy = IO_PENDING_WRITE;
         io->next = t->ready_write_ious;
         t->ready_write_ious = io;
+        oper->num_pending--;
+        t->num_global_pending--;
+        oper->num_pending_read--;
         if (ZBDEBUG && 0) 
                 fprintf(stderr, "finish_io io->busy:%d 2\n", io->busy);
     } else {
@@ -560,14 +570,14 @@ static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
 #else
     while(io_getevents(t->io_ctx, 1, &event, NULL) > 0) {
 #endif
-    struct timeval tv_now;
-        event_io = (struct io_unit *)((unsigned long)event.obj); 
+        struct timeval tv_now;
+            event_io = (struct io_unit *)((unsigned long)event.obj); 
 
-    gettimeofday(&tv_now, NULL);
-    finish_io(t, event_io, event.res, &tv_now);
+        gettimeofday(&tv_now, NULL);
+        finish_io(t, event_io, event.res, &tv_now);
 
-    if (oper->num_pending == 0)
-        break;
+        if (oper->num_pending == 0)
+            break;
     }
 done:
     if (oper->num_err) {
@@ -735,10 +745,19 @@ static void update_iou_counters(struct iocb **my_iocbs, int nr,
     struct io_unit *io;
     int i;
     for (i = 0 ; i < nr ; i++) {
-    io = (struct io_unit *)(my_iocbs[i]);
-    io->io_oper->num_pending++;
-    io->io_oper->started_ios++;
-    io->io_start_time = *tv_now;    /* set time of io_submit */
+        io = (struct io_unit *)(my_iocbs[i]);
+        io->io_oper->num_pending++;
+        
+        if (io->busy == IO_PENDING) {
+            io->io_oper->started_ios++;
+            io->io_oper->num_pending_read++;
+        } else if (io->busy == IO_PENDING_WRITE_SUBMIT) {
+            io->io_oper->num_pending_write++;
+        } else {
+            fprintf(stderr, "io->busy %d is error\n", io->busy);
+            exit(1);
+        }            
+        io->io_start_time = *tv_now;    /* set time of io_submit */
     }
 }
 
@@ -756,31 +775,31 @@ resubmit:
     calc_latency(&start_time, &stop_time, &t->io_submit_latency);
 
     if (ret != num_ios) {
-    /* some ios got through */
-    if (ret > 0) {
-        update_iou_counters(my_iocbs, ret, &stop_time);
-        my_iocbs += ret;
-        t->num_global_pending += ret;
-        num_ios -= ret;
-    }
-    /* 
-     * we've used all the requests allocated in aio_init, wait and
-     * retry
-     */
-    if (ret > 0 || ret == -EAGAIN) {
-        int old_ret = ret;
-            if (ZBDEBUG && 1) 
-                fprintf(stderr, "run_built will read_some_events\n");
-        if ((ret = read_some_events(t) > 0)) {
-        goto resubmit;
-        } else {
-            fprintf(stderr, "ret was %d and now is %d\n", ret, old_ret);
-        abort();
+        /* some ios got through */
+        if (ret > 0) {
+            update_iou_counters(my_iocbs, ret, &stop_time);
+            my_iocbs += ret;
+            t->num_global_pending += ret;
+            num_ios -= ret;
         }
-    }
+        /* 
+         * we've used all the requests allocated in aio_init, wait and
+         * retry
+         */
+        if (ret > 0 || ret == -EAGAIN) {
+            int old_ret = ret;
+                if (ZBDEBUG && 1) 
+                    fprintf(stderr, "run_built will read_some_events\n");
+            if ((ret = read_some_events(t) > 0)) {
+            goto resubmit;
+            } else {
+                fprintf(stderr, "ret was %d and now is %d\n", ret, old_ret);
+            abort();
+            }
+        }
 
-    fprintf(stderr, "ret %d (%s) on io_submit\n", ret, strerror(-ret));
-    return -1;
+        fprintf(stderr, "ret %d (%s) on io_submit\n", ret, strerror(-ret));
+        return -1;
     }
     update_iou_counters(my_iocbs, ret, &stop_time);
     t->num_global_pending += ret;
@@ -810,19 +829,19 @@ static int restart_oper(struct io_oper *oper) {
     }
 
     if (new_rw) {
-    oper->started_ios = 0;
-    oper->last_offset = oper->start;
-    oper->stonewalled = 0;
+        oper->started_ios = 0;
+        oper->last_offset = oper->start;
+        oper->stonewalled = 0;
 
-    /* 
-     * we're restarting an operation with pending requests, so the
-     * timing info won't be printed by finish_io.  Printing it here
-     */
-    if (oper->num_pending)
-        print_time(oper);
+        /* 
+         * we're restarting an operation with pending requests, so the
+         * timing info won't be printed by finish_io.  Printing it here
+         */
+        if (oper->num_pending)
+            print_time(oper);
 
-    oper->rw = new_rw;
-    return 1;
+        oper->rw = new_rw;
+        return 1;
     } 
     return 0;
 }
