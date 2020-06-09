@@ -38,7 +38,7 @@
 #include <string.h>
 #include <pthread.h>
 
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG
 #define PRINT(fmt, args...) \
 do {								            \
@@ -93,7 +93,6 @@ int shm_id;
 char *unaligned_buffer = NULL;
 char *aligned_buffer = NULL;
 int padded_reclen = 0;
-int stonewall = 1;
 int verify = 0;
 char *verify_buf = NULL;
 int unlink_files = 0;
@@ -169,9 +168,6 @@ struct io_oper {
 
     /* last offset used in an io operation */
     off_t last_offset;
-
-    /* stonewalled = 1 when we got cut off before submitting all our ios */
-    int stonewalled;
 
     /* list management */
     struct io_oper *next;
@@ -467,7 +463,7 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
         t->num_global_pending--;
         oper->num_pending_write--;
         check_finished_io(io);
-        if (!oper->num_pending && (oper->started_ios == oper->total_ios || oper->stonewalled)) {
+        if (!oper->num_pending && (oper->started_ios == oper->total_ios)) {
             print_time(oper);
         } 
     } else if (io->busy == IO_PENDING) {
@@ -520,13 +516,21 @@ static struct io_unit *find_iou(struct thread_info *t, struct io_oper *oper)
 {
     struct io_unit *event_io;
     int nr;
+    int select_write = 1;
 
 retry:
     if (oper->started_ios == oper->total_ios && !oper->num_pending) {
         return NULL;
     } 
 
-    if (t->ready_write_ious) {
+    if (oper->num_pending_write > oper->num_pending_read + io_iter/4 && oper->started_ios < oper->total_ios) {
+        select_write = 0;
+    }  
+
+    if (oper->last_offset == oper->end)
+        select_write = 1;
+
+    if (t->ready_write_ious && select_write) {
         event_io = t->ready_write_ious;
         t->ready_write_ious = t->ready_write_ious->next;
         if (event_io->busy != IO_PENDING_WRITE) {
@@ -536,9 +540,14 @@ retry:
         event_io->busy = IO_PENDING_WRITE_SUBMIT;
         event_io->res = 0;
         event_io->io_oper = oper;
+        #if 0
+        if (oper->num_pending_read + oper->num_pending_write > oper->depth/2)
+            read_some_events(t);
+        #endif
         return event_io;
     }
-    if (oper->started_ios < oper->total_ios) {
+    
+    if (oper->started_ios < oper->total_ios && oper->last_offset < oper->end) {
         if (t->free_ious) {
             event_io = t->free_ious;
             t->free_ious = t->free_ious->next;
@@ -546,16 +555,20 @@ retry:
                 fprintf(stderr, "io unit on free list but not free\n");
                 abort();
             }
+            #if 0
+            if (oper->num_pending_read + oper->num_pending_write > oper->depth/2)
+                read_some_events(t);
+            #endif
             return event_io;
         }
     }    
-    PRINT("read_some_events\n");
+    //PRINT("read_some_events\n");
     nr = read_some_events(t);
     if (nr > 0)
         goto retry;
     else {
-        fprintf(stderr, "no free ious after read_some_events\n");
-        exit(1);
+        //fprintf(stderr, "no free ious after read_some_events\n");  
+        ;
     }
     return NULL;
 }
@@ -587,7 +600,9 @@ static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
 
         gettimeofday(&tv_now, NULL);
         finish_io(t, event_io, event.res, &tv_now);
-
+        PRINT("thread %d oper->num_pending:%d read:%d write:%d global:%d\n", 
+            t - global_thread_info, oper->num_pending, oper->num_pending_read, 
+            oper->num_pending_write, t->num_global_pending);
         if (oper->num_pending == 0)
             break;
     }
@@ -650,7 +665,7 @@ static struct io_unit *build_iocb(struct thread_info *t, struct io_oper *oper)
     
     if (io->busy == IO_PENDING_WRITE_SUBMIT) {
         io_prep_pwrite(&io->iocb, oper->fd1, io->buf, io->len, io->offset);        
-        PRINT("write: io->offset %llu\n", io->offset);
+        //PRINT("write: io->offset %llu\n", io->offset);
     } else {
         io->offset = oper->last_offset;
         if (io->offset + oper->reclen > oper->end)
@@ -659,7 +674,7 @@ static struct io_unit *build_iocb(struct thread_info *t, struct io_oper *oper)
             io->len = oper->reclen;
         io_prep_pread(&io->iocb, oper->fd, io->buf, io->len, io->offset);
         oper->last_offset += io->len;
-        PRINT("read: io->offset %llu\n", io->offset);
+        //PRINT("read: io->offset %llu\n", io->offset);
     }
     return io;
 }
@@ -712,6 +727,8 @@ create_oper(int fd, int fd1, int rw, off_t start, off_t end, int reclen, int dep
     oper->total_ios = (oper->end - oper->start + oper->reclen - 1) / oper->reclen;
     oper->file_name = file_name;
     oper->file_name1 = file_name1;
+    PRINT("oper->total_ios:%d reclen:%d start:%llu end:%llu\n", 
+        oper->total_ios, oper->reclen, oper->start, oper->end);
 
     return oper;
 }
@@ -734,7 +751,7 @@ int build_oper(struct thread_info *t, struct io_oper *oper, int num_ios,
     for( i = 0 ; i < num_ios ; i++) {
         io = build_iocb(t, oper);
         if (!io) 
-                return -1;
+                return i;
         my_iocbs[i] = &io->iocb;
     }
     return num_ios;
@@ -780,6 +797,7 @@ resubmit:
     calc_latency(&start_time, &stop_time, &t->io_submit_latency);
 
     if (ret != num_ios) {
+        PRINT("ret:%d != num_ios:%d\n", ret, num_ios);
         /* some ios got through */
         if (ret > 0) {
             update_iou_counters(my_iocbs, ret, &stop_time);
@@ -835,7 +853,6 @@ static int restart_oper(struct io_oper *oper) {
     if (new_rw) {
         oper->started_ios = 0;
         oper->last_offset = oper->start;
-        oper->stonewalled = 0;
 
         /* 
          * we're restarting an operation with pending requests, so the
@@ -926,7 +943,10 @@ static int run_active_list(struct thread_info *t,
         } else {
             if (oper->started_ios == oper->total_ios && !oper->num_pending) {
                 oper_list_del(oper, &t->active_opers);
-                oper_list_add(oper, &t->finished_opers);         
+                oper_list_add(oper, &t->finished_opers);    
+                PRINT("id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
+                    t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
+                    oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
             } 
             break;
         }
@@ -944,6 +964,9 @@ static int run_active_list(struct thread_info *t,
             if (oper->started_ios == oper->total_ios && !oper->num_pending) {
                 oper_list_del(oper, &t->active_opers);
                 oper_list_add(oper, &t->finished_opers);
+                PRINT("id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
+                    t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
+                    oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
             }
         }
     }
@@ -1125,8 +1148,7 @@ void global_thread_throughput(struct thread_info *t) {
         fprintf(stderr, "throughput (%.2f MB/s) ", 
                 total_mb / runtime);
         fprintf(stderr, "%.2f MB in %.2fs", total_mb, runtime);
-        if (stonewall)
-            fprintf(stderr, " min transfer %.2fMB", min_trans);
+
         fprintf(stderr, "\n");
     }
 }
@@ -1174,16 +1196,13 @@ restart:
     cnt = 0;
     /* first we send everything through aio */
     while(t->active_opers && (cnt < iterations || iterations == RUN_FOREVER)) {
-        if (stonewall && threads_ending) {
-            oper = t->active_opers;
-            oper->stonewalled = 1;
-            oper_list_del(oper, &t->active_opers);
-            oper_list_add(oper, &t->finished_opers);
-        } else {
-            run_active_list(t, io_iter,  max_io_submit);
-        }
+        
+        run_active_list(t, io_iter,  max_io_submit);
+        
         cnt++;
     }
+    
+    PRINT("finish id:%d global:%2d\n", t - global_thread_info, t->num_global_pending);
     if (latency_stats)
         print_latency(t);
 
@@ -1195,7 +1214,13 @@ restart:
     do {
         if (!oper)
             break;
-        io_oper_wait(t, oper);
+        PRINT("wait: id:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
+            t - global_thread_info, oper->total_ios, oper->started_ios, oper->num_pending, 
+            oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
+        io_oper_wait(t, oper); 
+        PRINT("wait: id:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
+            t - global_thread_info, oper->total_ios, oper->started_ios, oper->num_pending, 
+            oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
         oper = oper->next;
     } while(oper != t->finished_opers);
 
@@ -1211,6 +1236,7 @@ restart:
         oper = oper->next;
         if (oper == t->finished_opers)
             break;
+        PRINT("thread %d totals %.2f MB\n", t - global_thread_info, t->stage_mb_trans);
     } 
 
     if (t->stage_mb_trans && t->num_files > 0) {
@@ -1219,7 +1245,8 @@ restart:
             t - global_thread_info, t->stage_mb_trans/seconds, 
         t->stage_mb_trans, seconds);
     }
-
+    
+    PRINT("thread %d finish cnt:%d\n", t - global_thread_info, cnt);
     if (num_threads > 1) {
         pthread_mutex_lock(&stage_mutex);
         threads_ending++;
@@ -1227,15 +1254,22 @@ restart:
             threads_starting = 0;
             pthread_cond_broadcast(&stage_cond);
             global_thread_throughput(t);
-    }
-    while(threads_ending != num_threads)
-        pthread_cond_wait(&stage_cond, &stage_mutex);
+        }
+
+        PRINT("thread %d finish threads_ending:%d num_threads:%d\n", 
+            t - global_thread_info, threads_ending, num_threads);
+        while(threads_ending != num_threads)
+            pthread_cond_wait(&stage_cond, &stage_mutex);
+        PRINT("thread %d finish threads_ending:%d num_threads:%d\n", 
+            t - global_thread_info, threads_ending, num_threads);
         pthread_mutex_unlock(&stage_mutex);
     }
     
     /* someone got restarted, go back to the beginning */
     if (t->active_opers && (cnt < iterations || iterations == RUN_FOREVER)) {
         iteration++;
+        PRINT("thread %d finish threads_ending:%d num_threads:%d\n", 
+            t - global_thread_info, threads_ending, num_threads);
         goto restart;
     }
 
@@ -1244,6 +1278,7 @@ restart:
         oper = t->finished_opers;
         oper_list_del(oper, &t->finished_opers);
         status = finish_oper(t, oper);
+        PRINT("thread %d finish threads_ending:%d threads_ending%d\n", t - global_thread_info, threads_ending);
     }
 
     if (t->num_global_pending) {
@@ -1332,7 +1367,6 @@ void print_usage(void) {
     printf("\t-t number of threads to run\n");
     printf("\t-u unlink files after completion\n");
     printf("\t-v verification of bytes written\n");
-    printf("\t-x turn off thread stonewalling\n");
     printf("\t-h this message\n");
     printf("\n\t   the size options (-a -s and -r) allow modifiers -s 400{k,m,g}\n");
     printf("\t   translate to 400KB, 400MB and 400GB\n");
@@ -1442,9 +1476,6 @@ int main(int ac, char **av)
         case 't':
             num_threads = atoi(optarg);
             break;
-        case 'x':
-            stonewall = 0;
-            break;
         case 'u':
             unlink_files = 1;
             break;
@@ -1539,8 +1570,8 @@ int main(int ac, char **av)
             else
                 file_size = filesize0;
            
-            delta = (file_size+rec_len-1)/(rec_len);
-            delta = delta*rec_len/num_contexts;
+            delta = (file_size)/(rec_len*num_contexts);
+            delta = delta*rec_len;
 
             start = j * delta;
             end = start + delta;
@@ -1590,3 +1621,4 @@ int main(int ac, char **av)
     }
     return status;
 }
+
