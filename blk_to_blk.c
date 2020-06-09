@@ -38,7 +38,15 @@
 #include <string.h>
 #include <pthread.h>
 
-#define ZBDEBUG 1
+#define DEBUG 1
+#if DEBUG
+#define PRINT(fmt, args...) \
+do {								            \
+	fprintf(stderr, "[B2B]%s:%d: " fmt, __func__, __LINE__, ##args); \
+} while (0)
+#else
+#define PRINT(fmt, args...) do {} while (0)
+#endif
 
 #define IO_FREE 0
 #define IO_PENDING 1
@@ -450,8 +458,7 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
 
     calc_latency(&io->io_start_time, tv_now, &t->io_completion_latency);
     io->res = result;
-    if (ZBDEBUG && 0) 
-        fprintf(stderr, "finish_io io->busy:%d 1\n", io->busy);
+    //PRINT("io->busy:%d 1\n", io->busy);
     if (io->busy == IO_PENDING_WRITE_SUBMIT) {
         io->busy = IO_FREE;
         io->next = t->free_ious;
@@ -469,9 +476,8 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
         t->ready_write_ious = io;
         //oper->num_pending--;
         t->num_global_pending--;
-        oper->num_pending_read--;
-        if (ZBDEBUG && 0) 
-            fprintf(stderr, "finish_io io->busy:%d 2\n", io->busy);
+        oper->num_pending_read--;         
+        //PRINT("io->busy:%d 2\n", io->busy);
     } else {
         fprintf(stderr, "error io->busy:%d\n", io->busy);
     }       
@@ -542,14 +548,15 @@ retry:
             }
             return event_io;
         }
-    }
-    if (ZBDEBUG && 0) 
-        fprintf(stderr, "find_iou will read_some_events\n");
+    }    
+    PRINT("read_some_events\n");
     nr = read_some_events(t);
     if (nr > 0)
         goto retry;
-    else
+    else {
         fprintf(stderr, "no free ious after read_some_events\n");
+        exit(1);
+    }
     return NULL;
 }
 
@@ -642,9 +649,8 @@ static struct io_unit *build_iocb(struct thread_info *t, struct io_oper *oper)
     }
     
     if (io->busy == IO_PENDING_WRITE_SUBMIT) {
-        io_prep_pwrite(&io->iocb, oper->fd1, io->buf, io->len, io->offset);
-        if (ZBDEBUG && 0) 
-            fprintf(stderr, "write build_oper: io->offset %llu\n", io->offset);
+        io_prep_pwrite(&io->iocb, oper->fd1, io->buf, io->len, io->offset);        
+        PRINT("write: io->offset %llu\n", io->offset);
     } else {
         io->offset = oper->last_offset;
         if (io->offset + oper->reclen > oper->end)
@@ -653,8 +659,7 @@ static struct io_unit *build_iocb(struct thread_info *t, struct io_oper *oper)
             io->len = oper->reclen;
         io_prep_pread(&io->iocb, oper->fd, io->buf, io->len, io->offset);
         oper->last_offset += io->len;
-        if (ZBDEBUG && 0) 
-            fprintf(stderr, "read build_oper: io->offset %llu\n", io->offset);
+        PRINT("read: io->offset %llu\n", io->offset);
     }
     return io;
 }
@@ -724,8 +729,7 @@ int build_oper(struct thread_info *t, struct io_oper *oper, int num_ios,
     if (oper->started_ios == 0)
         gettimeofday(&oper->start_time, NULL);
     
-    if (ZBDEBUG && 0) 
-        fprintf(stderr, "build_oper: num_ios %d\n", num_ios);
+    //PRINT("num_ios %d\n", num_ios);
     
     for( i = 0 ; i < num_ios ; i++) {
         io = build_iocb(t, oper);
@@ -788,9 +792,8 @@ resubmit:
          * retry
          */
         if (ret > 0 || ret == -EAGAIN) {
-            int old_ret = ret;
-            if (ZBDEBUG && 1) 
-                fprintf(stderr, "run_built will read_some_events\n");
+            int old_ret = ret;             
+            PRINT("will read_some_events\n");
             if ((ret = read_some_events(t) > 0)) {
                 goto resubmit;
             } else {
@@ -893,24 +896,23 @@ static int run_active_list(struct thread_info *t,
     int rw = READ;
     
     oper = t->active_opers;
-    while(oper) {
-        if (ZBDEBUG && 0) 
-            fprintf(stderr, "id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
-                t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
-                oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
+    while(oper) {        
+        PRINT("id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
+            t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
+            oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
         if (!oper_runnable(oper)) {
-            oper = oper->next;
-            if (ZBDEBUG && 1) 
-                fprintf(stderr, "oper_runnable is 0\n");
+            oper = oper->next;             
+            PRINT("oper_runnable is 0\n");
             if (oper == t->active_opers)
                 break;
             continue;
         }
-        
+#if 0 
         if ((oper->started_ios == oper->total_ios) && (!oper->num_pending_read) &&
-            oper->num_pending && (oper->num_pending == oper->num_pending_write)) {
+            oper->num_pending && (oper->num_pending == oper->num_pending_write)) {s            
             read_some_events(t);
         } 
+#endif
         
         ret = build_oper(t, oper, io_iter, my_iocbs);
         if (ret >= 0) {
