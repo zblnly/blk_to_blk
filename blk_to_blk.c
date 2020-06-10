@@ -85,7 +85,7 @@ int iterations = RUN_FOREVER;
 int max_io_submit = 0;
 long rec_len = 512 * 1024;
 int depth = 64;
-int num_threads = 1;
+int num_threads = 2;
 int num_contexts = 1;
 int fsync_stages = 1;
 int use_shm = 0;
@@ -126,9 +126,6 @@ struct io_latency {
 struct io_oper {
     /* already open file descriptor, valid for whatever operation you want */
     int fd;
-    
-    /* target block device fd */
-    int fd1;
 
     /* starting byte of the operation */
     off_t start;
@@ -144,12 +141,6 @@ struct io_oper {
 
     /* current number of pending requests */
     int num_pending;
-
-    /* current number of pending read requests */
-    int num_pending_read;
-
-    /* current number of pending write requests */
-    int num_pending_write;
 
     /* last error, zero if there were none */
     int last_err;
@@ -176,7 +167,6 @@ struct io_oper {
     struct timeval start_time;
 
     char *file_name;
-    char *file_name1;
 };
 
 /* a single io, and all the tracking needed for it */
@@ -242,9 +232,6 @@ struct thread_info {
     /* list of operations still in progress, and of those finished */
     struct io_oper *active_opers;
     struct io_oper *finished_opers;
-
-    /* number of files this thread is doing io on */
-    int num_files;
 
     /* how much io this thread did in the last stage */
     double stage_mb_trans;
@@ -375,9 +362,6 @@ static int check_finished_io(struct io_unit *io) {
 
 /* worker func to check the busy bits and get an io unit ready for use */
 static int grab_iou(struct io_unit *io, struct io_oper *oper) {
-    if (io->busy == IO_PENDING)
-        return -1;
-
     io->busy = IO_PENDING;
     io->res = 0;
     io->io_oper = oper;
@@ -472,7 +456,6 @@ void finish_io(struct thread_info *t, struct io_unit *io, long result,
         t->ready_write_ious = io;
         //oper->num_pending--;
         t->num_global_pending--;
-        oper->num_pending_read--;         
         //PRINT("io->busy:%d 2\n", io->busy);
     } else {
         fprintf(stderr, "error io->busy:%d\n", io->busy);
@@ -518,15 +501,26 @@ static struct io_unit *find_iou(struct thread_info *t, struct io_oper *oper)
     int nr;
     int select_write = 1;
 
+    if (oper->rw = READ) {
+        if (t->free_ious) {
+            event_io = t->free_ious;
+            t->free_ious = t->free_ious->next;
+            event_io->busy = IO_PENDING;
+            event_io->res = 0;
+            event_io->io_oper = oper;
+            return event_io;
+        }
+    } else if (oper->rw = WRITE) {
+
+    } else {
+        fprintf(stderr, "error on oper->rw:%d\n", oper->rw);
+        abort();
+    }
+
 retry:
     if (oper->started_ios == oper->total_ios && !oper->num_pending) {
         return NULL;
     } 
-
-    if (oper->num_pending_write >= oper->num_pending_read + io_iter/4 && oper->started_ios < oper->total_ios) {
-        select_write = 0;
-    }  
-
     if (oper->last_offset == oper->end)
         select_write = 1;
 
@@ -540,10 +534,6 @@ retry:
         event_io->busy = IO_PENDING_WRITE_SUBMIT;
         event_io->res = 0;
         event_io->io_oper = oper;
-        #if 0
-        if (oper->num_pending_read + oper->num_pending_write > oper->depth/2)
-            read_some_events(t);
-        #endif
         return event_io;
     }
     
@@ -555,10 +545,6 @@ retry:
                 fprintf(stderr, "io unit on free list but not free\n");
                 abort();
             }
-            #if 0
-            if (oper->num_pending_read + oper->num_pending_write > oper->depth/2)
-                read_some_events(t);
-            #endif
             return event_io;
         }
     }    
@@ -610,9 +596,8 @@ static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
 
         gettimeofday(&tv_now, NULL);
         finish_io(t, event_io, event.res, &tv_now);
-        PRINT("thread %d oper->num_pending:%d read:%d write:%d global:%d\n", 
-            t - global_thread_info, oper->num_pending, oper->num_pending_read, 
-            oper->num_pending_write, t->num_global_pending);
+        PRINT("thread %d oper->num_pending:%d global:%d\n", 
+            t - global_thread_info, oper->num_pending, t->num_global_pending);
 
         /* free all unwrite io */
         while (t->ready_write_ious) {
@@ -683,7 +668,7 @@ static struct io_unit *build_iocb(struct thread_info *t, struct io_oper *oper)
         return NULL;
     }
     
-    if (io->busy == IO_PENDING_WRITE_SUBMIT) {
+    if (io->busy == IO_FREE) {
         io_prep_pwrite(&io->iocb, oper->fd1, io->buf, io->len, io->offset);        
         //PRINT("write: io->offset %llu\n", io->offset);
     } else {
@@ -724,8 +709,8 @@ finish_oper(struct thread_info *t, struct io_oper *oper)
  * null on error
  */
 static struct io_oper * 
-create_oper(int fd, int fd1, int rw, off_t start, off_t end, int reclen, int depth,
-            int iter, char *file_name, char *file_name1)
+create_oper(int fd, int rw, off_t start, off_t end, int reclen, int depth,
+            int iter, char *file_name)
 {
     struct io_oper *oper;
 
@@ -741,12 +726,10 @@ create_oper(int fd, int fd1, int rw, off_t start, off_t end, int reclen, int dep
     oper->end = end;
     oper->last_offset = oper->start;
     oper->fd = fd;
-    oper->fd1 = fd1;
     oper->reclen = reclen;
     oper->rw = rw;
     oper->total_ios = (oper->end - oper->start + oper->reclen - 1) / oper->reclen;
     oper->file_name = file_name;
-    oper->file_name1 = file_name1;
     PRINT("oper->total_ios:%d reclen:%d start:%llu end:%llu\n", 
         oper->total_ios, oper->reclen, oper->start, oper->end);
 
@@ -792,7 +775,6 @@ static void update_iou_counters(struct iocb **my_iocbs, int nr,
         if (io->busy == IO_PENDING) {
             io->io_oper->num_pending++;
             io->io_oper->started_ios++;
-            io->io_oper->num_pending_read++;
             io->io_start_time = *tv_now;    /* set time of io_submit */
         } else if (io->busy == IO_PENDING_WRITE_SUBMIT) {
             io->io_oper->num_pending_write++;
@@ -887,28 +869,6 @@ static int restart_oper(struct io_oper *oper) {
     return 0;
 }
 
-static int oper_runnable(struct io_oper *oper) {
-    struct stat buf;
-    int ret;
-
-    /* first context is always runnable, if started_ios > 0, no need to
-     * redo the calculations
-     */
-    if (oper->started_ios || oper->start == 0)
-        return 1;
-    /*
-     * only the sequential phases force delays in starting */
-    if (oper->rw >= RWRITE)
-        return 1;
-    ret = fstat(oper->fd, &buf);
-    if (ret < 0) {
-        perror("fstat");
-        exit(1);
-    }
-    if (S_ISREG(buf.st_mode) && buf.st_size < oper->start)
-        return 0;
-    return 1;
-}
 
 /*
  * runs through all the io operations on the active list, and starts
@@ -930,27 +890,13 @@ static int run_active_list(struct thread_info *t,
     struct iocb **my_iocbs = t->iocbs;
     int ret = 0;
     int num_built = 0;
-    int rw = READ;
     
     oper = t->active_opers;
     while(oper) {        
-        PRINT("id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
-            t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
-            oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
-        if (!oper_runnable(oper)) {
-            oper = oper->next;             
-            PRINT("oper_runnable is 0\n");
-            if (oper == t->active_opers)
-                break;
-            continue;
-        }
-#if 0 
-        if ((oper->started_ios == oper->total_ios) && (!oper->num_pending_read) &&
-            oper->num_pending && (oper->num_pending == oper->num_pending_write)) {s            
-            read_some_events(t);
-        } 
-#endif
-        
+        PRINT("id:%d num_built:%d total:%d started:%d pending:%2d global:%2d\n", 
+            t - global_thread_info, num_built, oper->total_ios, oper->started_ios, 
+            oper->num_pending, t->num_global_pending);
+     
         ret = build_oper(t, oper, io_iter, my_iocbs);
         if (ret >= 0) {
             my_iocbs += ret;
@@ -964,9 +910,9 @@ static int run_active_list(struct thread_info *t,
             if (oper->started_ios == oper->total_ios && !oper->num_pending) {
                 oper_list_del(oper, &t->active_opers);
                 oper_list_add(oper, &t->finished_opers);    
-                PRINT("id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
-                    t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
-                    oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
+                PRINT("id:%d num_built:%d total:%d started:%d pending:%2d global:%2d\n", 
+                    t - global_thread_info, num_built, oper->total_ios, oper->started_ios, 
+                    oper->num_pending, t->num_global_pending);
             } 
             break;
         }
@@ -981,15 +927,6 @@ static int run_active_list(struct thread_info *t,
             oper = built_opers;
             oper_list_del(oper, &built_opers);
             oper_list_add(oper, &t->active_opers);
-            #if 0
-            if (oper->started_ios == oper->total_ios && !oper->num_pending) {
-                oper_list_del(oper, &t->active_opers);
-                oper_list_add(oper, &t->finished_opers);
-                PRINT("id:%d num_built:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
-                    t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
-                    oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
-            }
-            #endif
         }
     }
 
@@ -1021,11 +958,10 @@ void aio_setup(io_context_t *io_ctx, int n)
 /*
  * allocate io operation and event arrays for a given thread
  */
-int setup_ious(struct thread_info *t, 
-              int num_files, int depth, 
+int setup_ious(struct thread_info *t, int depth, 
           int reclen, int max_io_submit) {
     int i;
-    size_t bytes = num_files * depth * sizeof(*t->ios);
+    size_t bytes = depth * sizeof(*t->ios);
 
     t->ios = malloc(bytes);
     if (!t->ios) {
@@ -1034,7 +970,7 @@ int setup_ious(struct thread_info *t,
     }
     memset(t->ios, 0, bytes);
 
-    for (i = 0 ; i < depth * num_files; i++) {
+    for (i = 0 ; i < depth; i++) {
         t->ios[i].buf = aligned_buffer;
         aligned_buffer += padded_reclen;
         t->ios[i].buf_size = reclen;
@@ -1059,14 +995,14 @@ int setup_ious(struct thread_info *t,
 
     memset(t->iocbs, 0, max_io_submit * sizeof(struct iocb *));
 
-    t->events = malloc(sizeof(struct io_event) * depth * num_files);
+    t->events = malloc(sizeof(struct io_event) * depth);
     if (!t->events) {
         fprintf(stderr, "unable to allocate ram for events\n");
-    goto free_buffers;
+        goto free_buffers;
     }
-    memset(t->events, 0, num_files * sizeof(struct io_event)*depth);
+    memset(t->events, 0, sizeof(struct io_event)*depth);
 
-    t->num_global_ios = num_files * depth;
+    t->num_global_ios = depth;
     t->num_global_events = t->num_global_ios;
     return 0;
 
@@ -1095,9 +1031,9 @@ int setup_shared_mem(int num_threads, int num_files, int depth,
     
     padded_reclen = (reclen + page_size_mask) / (page_size_mask+1);
     padded_reclen = padded_reclen * (page_size_mask+1);
-    total_ram = num_files * depth * padded_reclen * num_threads;
+    total_ram = num_files * depth * padded_reclen;
     if (verify)
-        total_ram += padded_reclen * num_threads;
+        total_ram += padded_reclen * num_files;
 
     if (use_shm == USE_MALLOC) {
         p = malloc(total_ram + page_size_mask);
@@ -1189,13 +1125,13 @@ void global_thread_throughput(struct thread_info *t) {
 int worker(struct thread_info *t)
 {
     struct io_oper *oper;
-    char *this_stage = NULL;
     struct timeval stage_time;
     int status = 0;
-    int iteration = 0;
     int cnt;
-
+    int thread_id = 0;
     aio_setup(&t->io_ctx, 512);
+
+    thread_id = t - global_thread_info;
 
 restart:
     if (num_threads > 1) {
@@ -1211,7 +1147,6 @@ restart:
         pthread_mutex_unlock(&stage_mutex);
     }
     if (t->active_opers) {
-        this_stage = stage_name(t->active_opers->rw);
         gettimeofday(&stage_time, NULL);
         t->stage_mb_trans = 0;
     }
@@ -1229,7 +1164,7 @@ restart:
         cnt++;
     }
     
-    PRINT("finish id:%d global:%2d\n", t - global_thread_info, t->num_global_pending);
+    PRINT("finish thread_id:%d global:%2d\n", thread_id, t->num_global_pending);
     if (latency_stats)
         print_latency(t);
 
@@ -1241,13 +1176,13 @@ restart:
     do {
         if (!oper)
             break;
-        PRINT("wait: id:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
-            t - global_thread_info, oper->total_ios, oper->started_ios, oper->num_pending, 
-            oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
+        PRINT("wait: id:%d total:%d started:%d pending:%2d global:%2d\n", 
+            t - global_thread_info, oper->total_ios, oper->started_ios, 
+            oper->num_pending, t->num_global_pending);
         io_oper_wait(t, oper); 
-        PRINT("wait: id:%d total:%d started:%d pending:%2d read:%2d write:%2d global:%2d\n", 
-            t - global_thread_info, oper->total_ios, oper->started_ios, oper->num_pending, 
-            oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
+        PRINT("wait: id:%d total:%d started:%d pending:%2d global:%2d\n", 
+            t - global_thread_info, oper->total_ios, oper->started_ios, 
+            oper->num_pending, t->num_global_pending);
         oper = oper->next;
     } while(oper != t->finished_opers);
 
@@ -1425,14 +1360,11 @@ int main(int ac, char **av)
     int j;
     int c;
     off_t file_size;
-
-    int first_stage = READ;
     struct io_oper *oper;
+    struct io_oper *oper1;
     int status = 0;
-    int num_files = 0;
-    int open_fds = 0;
+    int num_files = 0;  
     struct thread_info *t;
-
     page_size_mask = getpagesize() - 1;
 
     while(1) {
@@ -1517,19 +1449,18 @@ int main(int ac, char **av)
         fprintf(stderr, "dropping io_iter to %d\n", io_iter);
     }
 
-    if (optind >= ac || (ac - optind) % 2 ) {
+    if (ac - optind != 2) {
         print_usage();
         exit(1);
     }
-
-    num_files = (ac - optind) / 2;
-
-    if (num_threads > (num_files * num_contexts)) {
+    num_files = 2;
+    
+    if (num_threads < num_files * num_contexts) {
         num_threads = num_files * num_contexts;
-        fprintf(stderr, "dropping thread count to the number of contexts %d\n", 
+        fprintf(stderr, "increasing thread count to the number of contexts %d\n", 
                 num_threads);
     }
-
+    
     t = malloc(num_threads * sizeof(*t));
     if (!t) {
         perror("malloc");
@@ -1541,7 +1472,7 @@ int main(int ac, char **av)
      * io_submit
      */
     if (!max_io_submit)
-        max_io_submit = 2 * num_files * io_iter * num_contexts;
+        max_io_submit = io_iter;
 
     /*
      * make sure we don't try to submit more ios than max_io_submit allows 
@@ -1560,17 +1491,12 @@ int main(int ac, char **av)
             num_threads, num_files, num_contexts, verify ? "on" : "off");
     /* open all the files and do any required setup for them */
     for (i = optind ; i < ac ; i = i + 2) {
-        int thread_index;
         for (j = 0 ; j < num_contexts ; j++) {
             off_t delta = 0;
             off_t start = 0;
             off_t filesize0 = 0;
             off_t filesize1 = 0;
             off_t end = 0;
-                    
-            thread_index = open_fds % num_threads;
-            open_fds++;
-
             rwfd = open(av[i], O_CREAT | O_RDWR | O_LARGEFILE | o_direct | o_sync , 0600);
             assert(rwfd != -1);
 
@@ -1597,19 +1523,26 @@ int main(int ac, char **av)
             if (j == num_contexts - 1)
                 end = file_size;
             
-             fprintf(stderr, "start %llu, end %llu, file_size %LuMB, %s size %LuMB, %s size %LuMB\n", 
+            fprintf(stderr, "start %llu, end %llu, file_size %LuMB, %s size %LuMB, %s size %LuMB\n", 
                 start, end, file_size/(1024*1024),
                 av[i], filesize0/(1024*1024), 
                 av[i+1], filesize1/(1024*1024));
             
-            oper = create_oper(rwfd, rwfd1, first_stage, start, end, rec_len, 
-                       depth, io_iter, av[i], av[i+1]);
+            oper = create_oper(rwfd, READ, start, end, rec_len, 
+                       depth, io_iter, av[i]);
             if (!oper) {
                 fprintf(stderr, "error in create_oper\n");
                 exit(-1);
             }
-            oper_list_add(oper, &t[thread_index].active_opers);
-            t[thread_index].num_files++;
+            oper_list_add(oper, &t[j].active_opers);
+ 
+            oper1 = create_oper(rwfd, WRITE, start, end, rec_len, 
+                       depth, io_iter, av[i+1]);
+            if (!oper1) {
+                fprintf(stderr, "error in create_oper1\n");
+                exit(-1);
+            }
+            oper_list_add(oper1, &t[j+1].active_opers);   
         }
     }
     if (setup_shared_mem(num_threads, num_files * num_contexts, 
@@ -1617,7 +1550,7 @@ int main(int ac, char **av)
         exit(1);
     }
     for (i = 0 ; i < num_threads ; i++) {
-        if (setup_ious(&t[i], t[i].num_files, depth, rec_len, max_io_submit))
+        if (setup_ious(&t[i], depth, rec_len, max_io_submit))
             exit(1);
     }
     if (num_threads > 1) {
