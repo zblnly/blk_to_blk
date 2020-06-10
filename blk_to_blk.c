@@ -38,7 +38,7 @@
 #include <string.h>
 #include <pthread.h>
 
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG
 #define PRINT(fmt, args...) \
 do {								            \
@@ -80,10 +80,10 @@ int o_direct = 0;
 int o_sync = 0;
 int latency_stats = 0;
 int completion_latency_stats = 0;
-int io_iter = 8;
+int io_iter = 32;
 int iterations = RUN_FOREVER;
 int max_io_submit = 0;
-long rec_len = 64 * 1024;
+long rec_len = 512 * 1024;
 int depth = 64;
 int num_threads = 1;
 int num_contexts = 1;
@@ -523,7 +523,7 @@ retry:
         return NULL;
     } 
 
-    if (oper->num_pending_write > oper->num_pending_read + io_iter/4 && oper->started_ios < oper->total_ios) {
+    if (oper->num_pending_write >= oper->num_pending_read + io_iter/4 && oper->started_ios < oper->total_ios) {
         select_write = 0;
     }  
 
@@ -1219,7 +1219,7 @@ restart:
     cnt = 0;
     /* first we send everything through aio */
     while (t->active_opers) {        
-        if (cnt >= iterations) {
+        if (cnt >= iterations && iterations != RUN_FOREVER) {
 			oper = t->active_opers;
 			oper_list_del(oper, &t->active_opers);
 			oper_list_add(oper, &t->finished_opers);
