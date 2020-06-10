@@ -38,7 +38,7 @@
 #include <string.h>
 #include <pthread.h>
 
-#define DEBUG 0
+#define DEBUG 1
 #if DEBUG
 #define PRINT(fmt, args...) \
 do {								            \
@@ -584,6 +584,16 @@ static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
         return 0;
     }
 
+    /* free all unwrite io */
+    while (t->ready_write_ious) {
+        event_io = t->ready_write_ious;
+        t->ready_write_ious = t->ready_write_ious->next;
+        event_io->busy = IO_FREE;
+        event_io->next = t->free_ious;
+        t->free_ious = event_io;
+        oper->num_pending--;               
+    }
+    
     if (oper->num_pending == 0)
         goto done;
 
@@ -603,6 +613,16 @@ static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
         PRINT("thread %d oper->num_pending:%d read:%d write:%d global:%d\n", 
             t - global_thread_info, oper->num_pending, oper->num_pending_read, 
             oper->num_pending_write, t->num_global_pending);
+
+        /* free all unwrite io */
+        while (t->ready_write_ious) {
+            event_io = t->ready_write_ious;
+            t->ready_write_ious = t->ready_write_ious->next;
+            event_io->busy = IO_FREE;
+            event_io->next = t->free_ious;
+            t->free_ious = event_io;
+            oper->num_pending--;               
+        }
         if (oper->num_pending == 0)
             break;
     }
@@ -961,6 +981,7 @@ static int run_active_list(struct thread_info *t,
             oper = built_opers;
             oper_list_del(oper, &built_opers);
             oper_list_add(oper, &t->active_opers);
+            #if 0
             if (oper->started_ios == oper->total_ios && !oper->num_pending) {
                 oper_list_del(oper, &t->active_opers);
                 oper_list_add(oper, &t->finished_opers);
@@ -968,6 +989,7 @@ static int run_active_list(struct thread_info *t,
                     t - global_thread_info, num_built, oper->total_ios, oper->started_ios, oper->num_pending, 
                     oper->num_pending_read, oper->num_pending_write, t->num_global_pending);
             }
+            #endif
         }
     }
 
@@ -1026,6 +1048,7 @@ int setup_ious(struct thread_info *t,
     if (verify) {
         verify_buf = aligned_buffer;
         memset(verify_buf, 'b', reclen);
+        aligned_buffer += padded_reclen;
     }
 
     t->iocbs = malloc(sizeof(struct iocb *) * max_io_submit);
@@ -1072,9 +1095,9 @@ int setup_shared_mem(int num_threads, int num_files, int depth,
     
     padded_reclen = (reclen + page_size_mask) / (page_size_mask+1);
     padded_reclen = padded_reclen * (page_size_mask+1);
-    total_ram = num_files * depth * padded_reclen + num_threads;
+    total_ram = num_files * depth * padded_reclen * num_threads;
     if (verify)
-        total_ram += padded_reclen;
+        total_ram += padded_reclen * num_threads;
 
     if (use_shm == USE_MALLOC) {
         p = malloc(total_ram + page_size_mask);
@@ -1185,7 +1208,7 @@ restart:
         }
         while (threads_starting != num_threads)
             pthread_cond_wait(&stage_cond, &stage_mutex);
-            pthread_mutex_unlock(&stage_mutex);
+        pthread_mutex_unlock(&stage_mutex);
     }
     if (t->active_opers) {
         this_stage = stage_name(t->active_opers->rw);
@@ -1195,10 +1218,14 @@ restart:
 
     cnt = 0;
     /* first we send everything through aio */
-    while(t->active_opers && (cnt < iterations || iterations == RUN_FOREVER)) {
-        
-        run_active_list(t, io_iter,  max_io_submit);
-        
+    while (t->active_opers) {        
+        if (cnt >= iterations) {
+			oper = t->active_opers;
+			oper_list_del(oper, &t->active_opers);
+			oper_list_add(oper, &t->finished_opers);
+		} else {
+			run_active_list(t, io_iter, max_io_submit);
+		}
         cnt++;
     }
     
@@ -1230,7 +1257,7 @@ restart:
     oper = t->finished_opers;
     while(oper) {
         if (fsync_stages) {
-            fsync(oper->fd1);
+            fsync(oper->fd1);            
         }
         t->stage_mb_trans += oper_mb_trans(oper);        
         oper = oper->next;
@@ -1243,7 +1270,7 @@ restart:
         double seconds = time_since_now(&stage_time);
         fprintf(stderr, "thread %d read/write totals (%.2f MB/s) %.2f MB in %.2fs\n", 
             t - global_thread_info, t->stage_mb_trans/seconds, 
-        t->stage_mb_trans, seconds);
+            t->stage_mb_trans, seconds);
     }
     
     PRINT("thread %d finish cnt:%d\n", t - global_thread_info, cnt);
@@ -1265,14 +1292,6 @@ restart:
         pthread_mutex_unlock(&stage_mutex);
     }
     
-    /* someone got restarted, go back to the beginning */
-    if (t->active_opers && (cnt < iterations || iterations == RUN_FOREVER)) {
-        iteration++;
-        PRINT("thread %d finish threads_ending:%d num_threads:%d\n", 
-            t - global_thread_info, threads_ending, num_threads);
-        goto restart;
-    }
-
     /* finally, free all the ram */
     while(t->finished_opers) {
         oper = t->finished_opers;
@@ -1441,8 +1460,8 @@ int main(int ac, char **av)
         case 'i':
             io_iter = atoi(optarg);
             break;
-            case 'I':
-              iterations = atoi(optarg);
+        case 'I':
+            iterations = atoi(optarg);
             break;
         case 'n':
             fsync_stages = 0;
