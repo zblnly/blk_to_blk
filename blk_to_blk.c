@@ -437,8 +437,8 @@ void finish_io(struct io_unit *io, long result, struct timeval *tv_now) {
 
     calc_latency(&io->io_start_time, tv_now, &major_thread->io_completion_latency);
     io->res = result;
-    PRINT("oper:%p io->busy:%d oper->rw:%d io->res:%lu oper->num_pending:%d\n", 
-        oper, io->busy, oper->rw, io->res, oper->num_pending);
+    //PRINT("oper:%p io->busy:%d oper->rw:%d io->res:%lu oper->num_pending:%d\n", 
+        //oper, io->busy, oper->rw, io->res, oper->num_pending);
     if (oper->rw == READ) {
         pthread_mutex_lock(&major_thread->partner_mutex);
         io->busy = IO_PENDING_WRITE;        
@@ -475,8 +475,8 @@ int read_some_events(struct thread_info *t) {
         min_nr = t->num_global_pending;
 
     nr = io_getevents(t->io_ctx, min_nr, t->num_global_events, t->events,NULL);
-    //PRINT("id:%d min_nr:%d global:%2d nr:%d\n", 
-      // t - global_thread_info, min_nr, t->num_global_pending, nr);
+    PRINT("id:%d min_nr:%d global:%2d nr:%d\n", 
+        t - global_thread_info, min_nr, t->num_global_pending, nr);
     if (nr <= 0)
         return nr;
 
@@ -516,30 +516,30 @@ retry:
             return io;
         }
         pthread_mutex_unlock(&t->partner_mutex);
-        
-        PRINT("partner_thread:%p t:%p global:%d mglobal:%d free:%p ready:%p rw:%d oper:%p\n", 
-                partner_thread, t, t->num_global_pending, major_thread->num_global_pending, 
-                t->free_ious, major_thread->ready_write_ious, oper->rw, oper);
-
+#if 0
+        PRINT("rw:%d partner_thread:%p t:%p read-global:%d write-global:%d free:%p ready:%p oper:%p\n", 
+                oper->rw, partner_thread, t, t->num_global_pending, partner_thread->num_global_pending, 
+                t->free_ious, major_thread->ready_write_ious, oper);
+#endif
         if (t->num_global_pending) {
             nr = read_some_events(t);
-            PRINT("partner_thread:%p t:%p global:%d mglobal:%d nr:%d free:%p rw:%d\n", 
-                partner_thread, t, partner_thread->num_global_pending, 
-                major_thread->num_global_pending, nr, t->free_ious, oper->rw);
-            if (nr > 0)
-                goto retry; 
+            PRINT("rw:%d partner_thread:%p t:%p read-global:%d write-global:%d nr:%d free:%p\n", 
+                oper->rw, partner_thread, t, partner_thread->num_global_pending, 
+                major_thread->num_global_pending, nr, t->free_ious);
         }
+        #if 0
         /* wait write finish */
         if (partner_thread->num_global_pending) {
             nr = read_some_events(partner_thread);
-            PRINT("partner_thread:%p t:%p global:%d mglobal:%d nr:%d free:%p rw:%d\n", 
-                partner_thread, t, partner_thread->num_global_pending, 
-                major_thread->num_global_pending, nr, t->free_ious, oper->rw);
+            PRINT("rw:%d partner_thread:%p t:%p read-global:%d write-global:%d nr:%d free:%p\n", 
+                oper->rw, partner_thread, t, partner_thread->num_global_pending, 
+                major_thread->num_global_pending, nr, t->free_ious);
             if (nr > 0)
                 goto retry;   
         }
+        #endif
         sched_yield();
-        usleep(500000);
+        //usleep(500000);
         goto retry; 
     } else if (oper->rw == WRITE) {
         /* find ready write iou */
@@ -555,29 +555,32 @@ retry:
             return io;
         }
         pthread_mutex_unlock(&major_thread->partner_mutex);
-        
-        PRINT("partner_thread:%p t:%p global:%d mglobal:%d free:%p ready:%p rw:%d oper:%p\n", 
-                partner_thread, t, t->num_global_pending, major_thread->num_global_pending, 
-                t->free_ious, major_thread->ready_write_ious, oper->rw, oper);
+      #if 0  
+        PRINT("rw:%d partner_thread:%p t:%p read-global:%d write-global:%d free:%p ready:%p rw:%d oper:%p\n", 
+                oper->rw, partner_thread, t, major_thread->num_global_pending, t->num_global_pending, 
+                major_thread->free_ious, major_thread->ready_write_ious, oper);
+      #endif
 
         if (t->num_global_pending) {
             nr = read_some_events(t);
-            PRINT("partner_thread:%p t:%p global:%d nr:%d free:%p rw:%d\n", 
-                partner_thread, t, partner_thread->num_global_pending, 
-                nr, t->free_ious, oper->rw);
-            if (nr > 0)
-                goto retry; 
-        }     
+            PRINT("rw:%d partner_thread:%p t:%p read-global:%d write-global:%d nr:%d free:%p\n", 
+                oper->rw, partner_thread, t, major_thread->num_global_pending, 
+                partner_thread->num_global_pending, 
+                nr, major_thread->free_ious);
+        }    
+        #if 0
         if (major_thread->num_global_pending) {
             nr = read_some_events(major_thread);
-            PRINT("partner_thread:%p t:%p global:%d nr:%d free:%p rw:%d\n", 
-                major_thread, t, major_thread->num_global_pending, 
-                nr, t->free_ious, oper->rw);
+            PRINT("rw:%d partner_thread:%p t:%p read-global:%d write-global:%d nr:%d free:%p\n", 
+                oper->rw, partner_thread, t, major_thread->num_global_pending, 
+                partner_thread->num_global_pending, 
+                nr, major_thread->free_ious);
             if (nr > 0)
                 goto retry; 
         }
-        //sched_yield();
-        usleep(500000);
+        #endif
+        sched_yield();
+        //usleep(500000);
         goto retry; 
     } else {
         fprintf(stderr, "error on oper->rw:%d\n", oper->rw);
@@ -592,49 +595,19 @@ retry:
 static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
     struct io_event event;
     struct io_unit *event_io;
+    struct thread_info *partner_thread = t->partner_thread;
 
     if (oper == NULL) {
         return 0;
     }
 
-    /* free all unwrite io */
-    while (t->ready_write_ious) {
-        event_io = t->ready_write_ious;
-        t->ready_write_ious = t->ready_write_ious->next;
-        event_io->busy = IO_FREE;
-        event_io->next = t->free_ious;
-        t->free_ious = event_io;
-        oper->num_pending--;         
-    }
-    
-    if (oper->num_pending == 0)
-        goto done;
-
-    /* this func is not speed sensitive, no need to go wild reading
-     * more than one event at a time
-     */
-    while(io_getevents(t->io_ctx, 1, 1, &event, NULL) > 0) {
-        struct timeval tv_now;
-            event_io = (struct io_unit *)((unsigned long)event.obj); 
-
-        gettimeofday(&tv_now, NULL);
-        finish_io(event_io, event.res, &tv_now);
-        t->num_global_pending--;
-        PRINT("thread %d oper->num_pending:%d global:%d\n", 
-            t - global_thread_info, oper->num_pending, t->num_global_pending);
-
-        /* free all unwrite io */
+    if (oper->rw == READ) {        
         while (t->ready_write_ious) {
-            event_io = t->ready_write_ious;
-            t->ready_write_ious = t->ready_write_ious->next;
-            event_io->busy = IO_FREE;
-            event_io->next = t->free_ious;
-            t->free_ious = event_io;
-            oper->num_pending--;               
+            PRINT("READ: t->ready_write_ious:%p write-global:%d\n", 
+                t->ready_write_ious, partner_thread->num_global_pending);
+            usleep(100000);  
         }
-        if (oper->num_pending == 0)
-            break;
-    }
+    } 
 done:
     if (oper->num_err) {
         fprintf(stderr, "%u errors on oper, last %u\n", 
@@ -864,33 +837,48 @@ static int run_active_list(struct thread_info *t,
     struct iocb **my_iocbs = t->iocbs;
     int ret = 0;
     int num_built = 0;
-    
+    int nums_io = io_iter;
+   
     oper = t->active_opers;
     while(oper) { 
         #if 1
-        PRINT("[1]id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
-           t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
+        PRINT("rw:%d id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
+           oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
            oper->num_pending, t->num_global_pending, ret);  
 
         #endif
-        #if 0
-        if (oper->num_pending >= max_io_submit) {
+
+        //usleep(100000);
+  
+        if (!t->num_global_pending && (oper->started_ios == oper->total_ios)) {
+            print_time(oper);
+            oper_list_del(oper, &t->active_opers);
+            oper_list_add(oper, &t->finished_opers);
+            PRINT("rw:%d finish id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
+                oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
+                oper->num_pending, t->num_global_pending, ret);
+            break;
+        }
+
+        if (t->num_global_pending && (oper->started_ios == oper->total_ios)) {
             read_some_events(t);
-        } 
-        #endif
-        ret = build_oper(t, oper, io_iter, my_iocbs);
-        PRINT("[2]id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
-           t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
+            continue;
+        }
+
+        if ((oper->total_ios - oper->started_ios) < io_iter)
+            nums_io = (oper->total_ios - oper->started_ios);
+        
+        ret = build_oper(t, oper, nums_io, my_iocbs);
+        PRINT("rw:%d [2]id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
+           oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
            oper->num_pending, t->num_global_pending, ret);  
-        if (ret >= 0) {
+        if (ret > 0) {
             my_iocbs += ret;
             num_built += ret;
             oper_list_del(oper, &t->active_opers);
             oper_list_add(oper, &built_opers);
             oper = t->active_opers;
-            if (num_built + io_iter > max_io_submit)
-                break;
-        }       
+        }   
     }
     if (num_built) {
         ret = run_built(t, num_built, t->iocbs);
@@ -905,9 +893,6 @@ static int run_active_list(struct thread_info *t,
         }
     }
     
-    PRINT("3 id:%d num_built:%d global:%2d ret:%d\n", 
-       t - global_thread_info, num_built, t->num_global_pending, ret); 
-
     return 0;
 }
 
