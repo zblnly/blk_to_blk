@@ -38,7 +38,7 @@
 #include <sys/syscall.h> 
 
 #define gettidv1() syscall(__NR_gettid)
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG
 #define PRINT(fmt, args...) \
 do {								            \
@@ -136,9 +136,6 @@ struct io_oper {
 
     /* max number of pending requests before a wait is triggered */
     int depth;
-
-    /* current number of pending requests */
-    int num_pending;
 
     /* last error, zero if there were none */
     int last_err;
@@ -256,7 +253,7 @@ static double time_since(struct timeval *start_tv, struct timeval *stop_tv)
     usec = stop_tv->tv_usec - start_tv->tv_usec;
     if (sec > 0 && usec < 0) {
         sec--;
-    usec += 1000000;
+        usec += 1000000;
     } 
     ret = sec + usec / (double)1000000;
     if (ret < 0)
@@ -325,34 +322,6 @@ static void oper_list_del(struct io_oper *oper, struct io_oper **list)
         *list = oper->next;
 }
 
-/* worker func to check error fields in the io unit */
-static int check_finished_io(struct io_unit *io) {
-    int i;
-    if (io->res != io->buf_size) {
-
-         struct stat s;
-         fstat(io->io_oper->fd, &s);
-  
-         /*
-          * If file size is large enough for the read, then this short
-          * read is an error.
-          */
-         if ((io->io_oper->rw == READ || io->io_oper->rw == RREAD) &&
-             s.st_size > (io->iocb.u.c.offset + io->res)) {
-  
-                 fprintf(stderr, "io err %lu (%s) op %d, off %Lu size %d\n",
-                         io->res, strerror(-io->res), io->iocb.aio_lio_opcode,
-                         io->iocb.u.c.offset, io->buf_size);
-                 io->io_oper->last_err = io->res;
-                 io->io_oper->num_err++;
-                 return -1;
-         }
-    }    
-    return 0;
-}
-
-
-
 char *stage_name(int rw) {
     switch(rw) {
     case WRITE:
@@ -371,17 +340,53 @@ static inline double oper_mb_trans(struct io_oper *oper) {
     return ((double)oper->started_ios * (double)oper->reclen) /
                 (double)(1024 * 1024);
 }
-
-static void print_time(struct io_oper *oper) {
+static void print_progress(struct io_unit *io) {
     double runtime;
-    double tput;
-    double mb;
+	double tput;
+	double mb;
+    long progress;
+    struct io_oper *oper = io->io_oper;    
+    int total_ios = oper->total_ios;
 
-    runtime = time_since_now(&oper->start_time); 
-    mb = oper_mb_trans(oper);
-    tput = mb / runtime;
-    fprintf(stderr, "%s on %s (%.2f MB/s) %.2f MB in %.2fs\n", 
-        stage_name(oper->rw), oper->file_name, tput, mb, runtime);
+	runtime = time_since_now(&oper->start_time);
+	mb = oper_mb_trans(oper);
+	tput = mb / runtime;
+    
+    progress = (io->offset - oper->start)/rec_len;
+    if (!(progress%(total_ios/10)) && progress*100/total_ios) {        
+        fprintf(stderr, "%s on %s (%7.2f MB/s) %12.2f MB in %6.2fs -- percent %2d finish\n", 
+            stage_name(oper->rw), oper->file_name, tput, mb, runtime, progress*100/total_ios);  
+    }
+}
+
+
+/* worker func to check error fields in the io unit */
+static int check_finished_io(struct io_unit *io) {
+    int i;
+
+    print_progress(io);
+    
+    if (io->res != io->buf_size) {
+
+         struct stat s;
+         fstat(io->io_oper->fd, &s);
+  
+         /*
+          * If file size is large enough for the read, then this short
+          * read is an error.
+          */
+         if ((io->io_oper->rw == READ) &&
+             s.st_size > (io->iocb.u.c.offset + io->res)) {
+  
+                 fprintf(stderr, "io err %lu (%s) op %d, off %Lu size %d\n",
+                         io->res, strerror(-io->res), io->iocb.aio_lio_opcode,
+                         io->iocb.u.c.offset, io->buf_size);
+                 io->io_oper->last_err = io->res;
+                 io->io_oper->num_err++;
+                 return -1;
+         }
+    }    
+    return 0;
 }
 
 static void print_lat(char *str, struct io_latency *lat) {
@@ -430,19 +435,15 @@ void finish_io(struct io_unit *io, long result, struct timeval *tv_now) {
         io->busy = IO_PENDING_WRITE;        
         io->next = major_thread->ready_write_ious;
         major_thread->ready_write_ious = io;        
-        oper->num_pending--;
         pthread_mutex_unlock(&major_thread->partner_mutex);
     } else if (oper->rw == WRITE) {        
         pthread_mutex_lock(&major_thread->partner_mutex);
         io->busy = IO_FREE;
         io->next = major_thread->free_ious;
-        major_thread->free_ious = io;        
-        oper->num_pending--;        
-        pthread_mutex_unlock(&major_thread->partner_mutex);
+        major_thread->free_ious = io;    
         check_finished_io(io);
-        if (!oper->num_pending && (oper->started_ios == oper->total_ios)) {
-            print_time(oper);
-        } 
+        pthread_mutex_unlock(&major_thread->partner_mutex);
+        
     } else {
         fprintf(stderr, "error io->io_oper->rw:%d\n", io->io_oper->rw);
         abort();
@@ -591,7 +592,7 @@ static int io_oper_wait(struct thread_info *t, struct io_oper *oper) {
         while (t->ready_write_ious) {
             PRINT("READ: t->ready_write_ious:%p write-global:%d\n", 
                 t->ready_write_ious, partner_thread->num_global_pending);
-            usleep(100000);  
+            usleep(50000);  
         }
     } 
 done:
@@ -678,8 +679,8 @@ finish_oper(struct thread_info *t, struct io_oper *oper)
 
     io_oper_wait(t, oper);
     last_err = oper->last_err;
-    if (oper->num_pending > 0) {
-        fprintf(stderr, "oper num_pending is %d\n", oper->num_pending);
+    if (t->num_global_pending > 0) {
+        fprintf(stderr, "thread num_global_pending is %d\n", t->num_global_pending);
     }
     close(oper->fd);
     free(oper);
@@ -753,7 +754,6 @@ static void update_iou_counters(struct iocb **my_iocbs, int nr,
     int i;
     for (i = 0 ; i < nr ; i++) {
         io = (struct io_unit *)(my_iocbs[i]);   
-        io->io_oper->num_pending++;
         io->io_oper->started_ios++;
         io->io_start_time = *tv_now;    /* set time of io_submit */
     }
@@ -827,22 +827,17 @@ static int run_active_list(struct thread_info *t,
    
     oper = t->active_opers;
     while(oper) { 
-        #if 1
-        PRINT("rw:%d id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
-           oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
-           oper->num_pending, t->num_global_pending, ret);  
 
-        #endif
-
-        //usleep(100000);
-  
-        if (!t->num_global_pending && (oper->started_ios == oper->total_ios)) {
-            print_time(oper);
+        PRINT("rw:%d id:%d blt:%d oper:%p total:%d started:%d global:%2d ret:%d\n", 
+           oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, 
+           oper->started_ios, t->num_global_pending, ret);  
+ 
+        if (!t->num_global_pending && (oper->started_ios == oper->total_ios)) {            
             oper_list_del(oper, &t->active_opers);
             oper_list_add(oper, &t->finished_opers);
-            PRINT("rw:%d finish id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
-                oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
-                oper->num_pending, t->num_global_pending, ret);
+            PRINT("rw:%d finish id:%d blt:%d oper:%p total:%d started:%d global:%2d ret:%d\n", 
+                oper->rw, t - global_thread_info, num_built, oper, oper->total_ios,  
+                oper->started_ios, t->num_global_pending, ret);
             break;
         }
 
@@ -855,9 +850,9 @@ static int run_active_list(struct thread_info *t,
             nums_io = (oper->total_ios - oper->started_ios);
         
         ret = build_oper(t, oper, nums_io, my_iocbs);
-        PRINT("rw:%d [2]id:%d blt:%d oper:%p total:%d started:%d pending:%2d global:%2d ret:%d\n", 
+        PRINT("rw:%d id:%d blt:%d oper:%p total:%d started:%d global:%2d ret:%d\n", 
            oper->rw, t - global_thread_info, num_built, oper, oper->total_ios, oper->started_ios, 
-           oper->num_pending, t->num_global_pending, ret);  
+           t->num_global_pending, ret);  
         if (ret > 0) {
             my_iocbs += ret;
             num_built += ret;
@@ -1028,31 +1023,6 @@ free_buffers:
     return -1;
 }
 
-/*
- * runs through all the thread_info structs and calculates a combined
- * throughput
- */
-void global_thread_throughput(struct thread_info *t) {
-    int i;
-    double runtime = time_since_now(&global_stage_start_time);
-    double total_mb = 0;
-    double min_trans = 0;
-
-    for (i = 0 ; i < num_threads ; i++) {
-        total_mb += global_thread_info[i].stage_mb_trans;
-    if (!min_trans || t->stage_mb_trans < min_trans)
-        min_trans = t->stage_mb_trans;
-    }
-    if (total_mb) {
-        fprintf(stderr, "throughput (%.2f MB/s) ", 
-                total_mb / runtime);
-        fprintf(stderr, "%.2f MB in %.2fs", total_mb, runtime);
-
-        fprintf(stderr, "\n");
-    }
-}
-
-
 /* this is the meat of the state machine.  There is a list of
  * active operations structs, and as each one finishes the required
  * io it is moved to a list of finished operations.  Once they have
@@ -1116,13 +1086,13 @@ restart:
     do {
         if (!oper)
             break;
-        PRINT("wait: id:%d total:%d started:%d pending:%2d global:%2d\n", 
-            t - global_thread_info, oper->total_ios, oper->started_ios, 
-            oper->num_pending, t->num_global_pending);
+        PRINT("wait: id:%d total:%d started:%d global:%2d\n", 
+            thread_id, oper->total_ios, oper->started_ios, 
+            t->num_global_pending);
         io_oper_wait(t, oper); 
-        PRINT("wait: id:%d total:%d started:%d pending:%2d global:%2d\n", 
-            t - global_thread_info, oper->total_ios, oper->started_ios, 
-            oper->num_pending, t->num_global_pending);
+        PRINT("wait: id:%d total:%d started:%d global:%2d\n", 
+            thread_id, oper->total_ios, oper->started_ios, 
+            t->num_global_pending);
         oper = oper->next;
     } while(oper != t->finished_opers);
 
@@ -1138,32 +1108,31 @@ restart:
         oper = oper->next;
         if (oper == t->finished_opers)
             break;
-        PRINT("thread %d totals %.2f MB\n", t - global_thread_info, t->stage_mb_trans);
+        PRINT("thread %d totals %.2f MB\n", thread_id, t->stage_mb_trans);
     } 
 
     if (t->stage_mb_trans) {
         double seconds = time_since_now(&stage_time);
-        fprintf(stderr, "thread %d read/write totals (%.2f MB/s) %.2f MB in %.2fs\n", 
-            t - global_thread_info, t->stage_mb_trans/seconds, 
+        fprintf(stderr, "%s thread %d totals (%.2f MB/s) %.2f MB in %.2fs\n", 
+            thread_id%2 ? "write":"read ", thread_id, t->stage_mb_trans/seconds, 
             t->stage_mb_trans, seconds);
     }
     
-    PRINT("thread %d finish cnt:%d\n", t - global_thread_info, cnt);
+    PRINT("thread %d finish cnt:%d\n", thread_id, cnt);
     if (num_threads > 1) {
         pthread_mutex_lock(&stage_mutex);
         threads_ending++;
         if (threads_ending == num_threads) {
             threads_starting = 0;
-            pthread_cond_broadcast(&stage_cond);
-            global_thread_throughput(t);
+            pthread_cond_broadcast(&stage_cond);        
         }
 
         PRINT("thread %d finish threads_ending:%d num_threads:%d\n", 
-            t - global_thread_info, threads_ending, num_threads);
+            thread_id, threads_ending, num_threads);
         while(threads_ending != num_threads)
             pthread_cond_wait(&stage_cond, &stage_mutex);
         PRINT("thread %d finish threads_ending:%d num_threads:%d\n", 
-            t - global_thread_info, threads_ending, num_threads);
+            thread_id, threads_ending, num_threads);
         pthread_mutex_unlock(&stage_mutex);
     }
     
@@ -1172,7 +1141,7 @@ restart:
         oper = t->finished_opers;
         oper_list_del(oper, &t->finished_opers);
         status = finish_oper(t, oper);
-        PRINT("thread %d finish threads_ending:%d threads_ending%d\n", t - global_thread_info, threads_ending);
+        PRINT("thread %d finish threads_ending:%d threads_ending%d\n", thread_id, threads_ending);
     }
 
     if (t->num_global_pending) {
@@ -1471,7 +1440,7 @@ int main(int ac, char **av)
         printf("Running multi thread version num_threads:%d\n", num_threads);
         run_workers(t, num_threads);
     } else {
-        printf("Running single thread version \n");
+        printf("Running single thread version\n");
         status = worker(t);
     }
 
