@@ -80,6 +80,7 @@ int o_direct = O_DIRECT;
 int o_sync = 0;
 int latency_stats = 0;
 int completion_latency_stats = 0;
+int print_speed = 0;
 int io_iter = 8;
 int iterations = RUN_FOREVER;
 int max_io_submit = 16;
@@ -349,6 +350,9 @@ static void print_progress(struct io_unit *io) {
     struct io_oper *oper = io->io_oper;    
     int total_ios = oper->total_ios;
 
+    if (!print_speed)
+        return;
+    
 	runtime = time_since_now(&oper->start_time);
 	mb = oper_mb_trans(oper);
 	tput = mb / runtime;
@@ -1228,6 +1232,7 @@ void print_usage(void) {
     printf("\t-n no fsyncs before exit\n");
     printf("\t-l print io_submit latencies after each stage\n");
     printf("\t-L print io completion latencies after each stage\n");
+    printf("\t-p print copy progress\n");
     printf("\t-h this message\n");
     printf("\n\t   the size options (-a and -r) allow modifiers -s 400{k,m,g}\n");
     printf("\t   translate to 400KB, 400MB and 400GB\n");
@@ -1273,7 +1278,7 @@ int main(int ac, char **av)
     page_size_mask = getpagesize() - 1;
 
     while(1) {
-        c = getopt(ac, av, "a:c:m:r:d:i:I:O:lLnhS");
+        c = getopt(ac, av, "a:c:m:r:d:i:I:O:lLnhSp");
         if  (c < 0)
             break;
 
@@ -1305,6 +1310,9 @@ int main(int ac, char **av)
             break;
         case 'L':
             completion_latency_stats = 1;
+            break;
+        case 'p':
+            print_speed = 1;
             break;
         case 'm':
             if (!strcmp(optarg, "shm")) {
