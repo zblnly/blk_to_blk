@@ -35,12 +35,14 @@
 #include <sys/mman.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/syscall.h> 
 
-#define DEBUG 0
+#define gettidv1() syscall(__NR_gettid)
+#define DEBUG 1
 #if DEBUG
 #define PRINT(fmt, args...) \
 do {								            \
-	fprintf(stderr, "[B2B]%s:%d: " fmt, __func__, __LINE__, ##args); \
+	fprintf(stderr, "[B2B %d %17s %4d] " fmt, gettidv1(), __func__, __LINE__, ##args); \
 } while (0)
 #else
 #define PRINT(fmt, args...) do {} while (0)
