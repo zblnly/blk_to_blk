@@ -1437,10 +1437,10 @@ int main(int ac, char **av)
                 fprintf(stderr, "error in create_oper\n");
                 exit(-1);
             }
-            oper_list_add(oper, &t[j].active_opers);
-            t[j].partner_thread = &t[j+1];
-            pthread_mutex_init(&t[j].partner_mutex, NULL);
-            t[j].major_thread = &t[j];
+            oper_list_add(oper, &t[2*j].active_opers);
+            t[2*j].partner_thread = &t[2*i+1];
+            pthread_mutex_init(&t[2*j].partner_mutex, NULL);
+            t[2*j].major_thread = &t[2*j];
  
             oper1 = create_oper(rwfd1, WRITE, start, end, rec_len, 
                        depth, io_iter, av[i+1]);
@@ -1448,16 +1448,13 @@ int main(int ac, char **av)
                 fprintf(stderr, "error in create_oper1\n");
                 exit(-1);
             }
-            oper_list_add(oper1, &t[j+1].active_opers);  
-            t[j+1].partner_thread = &t[j];
+            oper_list_add(oper1, &t[2*j+1].active_opers);  
+            t[2*j+1].partner_thread = &t[2*j];
             pthread_mutex_init(&t[j].partner_mutex, NULL);
-            t[j+1].major_thread = &t[j];
+            t[2*j+1].major_thread = &t[2*j];
             PRINT("%d: major_thread:%p partner_thread:%p %d: major_thread:%p partner_thread:%p\n", 
-                j, t[j].major_thread, t[j].partner_thread, 
-                j+1, t[j+1].major_thread, t[j+1].partner_thread);
-            PRINT("t:%p global_thread_info:%p 0:%p 1:%p \n", t, global_thread_info,
-                &(global_thread_info[0]), 
-                &global_thread_info[1]);
+                2*j, t[2*j].major_thread, t[2*j].partner_thread, 
+                2*j+1, t[2*j+1].major_thread, t[2*j+1].partner_thread);
         }
     }
     if (setup_shared_mem(num_threads, num_files * num_contexts, 
