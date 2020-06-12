@@ -345,6 +345,7 @@ static void print_progress(struct io_unit *io) {
 	double tput;
 	double mb;
     long progress;
+    static int last_printtime = 0;
     struct io_oper *oper = io->io_oper;    
     int total_ios = oper->total_ios;
 
@@ -353,9 +354,11 @@ static void print_progress(struct io_unit *io) {
 	tput = mb / runtime;
     
     progress = (io->offset - oper->start)/rec_len;
-    if (!(progress%(total_ios/10)) && progress*100/total_ios) {        
+    if ((!(progress%(total_ios/10))) && progress*100/total_ios || 
+        ((int)runtime - last_printtime >=20)) {        
         fprintf(stderr, "%s on %s (%7.2f MB/s) %12.2f MB in %6.2fs -- percent %2d finish\n", 
-            stage_name(oper->rw), oper->file_name, tput, mb, runtime, progress*100/total_ios);  
+            stage_name(oper->rw), oper->file_name, tput, mb, runtime, progress*100/total_ios);
+        last_printtime = (int)runtime;
     }
 }
 
