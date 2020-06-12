@@ -14,7 +14,7 @@
  * Please mail BinZhang (zblnly@qq.com) with bug reports or patches
  */
 #define _FILE_OFFSET_BITS 64
-#define PROG_VERSION "0.01"
+#define PROG_VERSION "1.0.0"
 #define _LARGEFILE_SOURCE
 #define _LARGEFILE64_SOURCE
 #define _FILE_OFFSET_BITS 64 
