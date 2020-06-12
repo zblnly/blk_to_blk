@@ -1,7 +1,8 @@
 # blk_to_blk
 linux block device to block device copy
 
-version V1.0.0
+
+
 [root@52_204 blk_to_blk]# ./b2b 
 usage: b2b [-r size] [-a size] [-d num] [-i num]
            [-c num] [-O 0|1][-nhS ] file1 file2
@@ -24,3 +25,6 @@ usage: b2b [-r size] [-a size] [-d num] [-i num]
            translate to 400KB, 400MB and 400GB
 version 1.0.0
 [root@52_204 blk_to_blk]# 
+
+
+
