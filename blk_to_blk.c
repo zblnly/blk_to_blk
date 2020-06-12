@@ -36,7 +36,7 @@
 #include <string.h>
 #include <pthread.h>
 
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG
 #define PRINT(fmt, args...) \
 do {								            \
@@ -74,15 +74,15 @@ enum {
  */
 long stages = 0;
 unsigned long page_size_mask;
-int o_direct = 0;
+int o_direct = O_DIRECT;
 int o_sync = 0;
 int latency_stats = 0;
 int completion_latency_stats = 0;
-int io_iter = 32;
+int io_iter = 8;
 int iterations = RUN_FOREVER;
-int max_io_submit = 0;
-long rec_len = 512 * 1024;
-int depth = 64;
+int max_io_submit = 16;
+long rec_len = 1024 * 1024;
+int depth = 32;
 int num_threads = 2;
 int num_contexts = 1;
 int fsync_stages = 1;
@@ -91,8 +91,6 @@ int shm_id;
 char *unaligned_buffer = NULL;
 char *aligned_buffer = NULL;
 int padded_reclen = 0;
-int verify = 0;
-char *verify_buf = NULL;
 int unlink_files = 0;
 
 struct io_unit;
@@ -347,21 +345,7 @@ static int check_finished_io(struct io_unit *io) {
                  io->io_oper->num_err++;
                  return -1;
          }
-    }
-    if (verify && io->io_oper->rw == READ) {
-        if (memcmp(io->buf, verify_buf, io->io_oper->reclen)) {
-        fprintf(stderr, "verify error, file %s offset %Lu contents (offset:bad:good):\n", 
-                io->io_oper->file_name, io->iocb.u.c.offset);
-        
-        for (i = 0 ; i < io->io_oper->reclen ; i++) {
-            if (io->buf[i] != verify_buf[i]) {
-            fprintf(stderr, "%d:%c:%c ", i, io->buf[i], verify_buf[i]);
-        }
-        }
-        fprintf(stderr, "\n");
-    }
-
-    }
+    }    
     return 0;
 }
 
@@ -938,17 +922,9 @@ int setup_ious(struct thread_info *t, int depth,
         t->ios[i].buf = aligned_buffer;
         aligned_buffer += padded_reclen;
         t->ios[i].buf_size = reclen;
-        if (verify)
-            memset(t->ios[i].buf, 'b', reclen);
-        else
-            memset(t->ios[i].buf, 0, reclen);
+        memset(t->ios[i].buf, 0, reclen);
         t->ios[i].next = major_thread->free_ious;
         major_thread->free_ious = t->ios + i;
-    }
-    if (verify) {
-        verify_buf = aligned_buffer;
-        memset(verify_buf, 'b', reclen);
-        aligned_buffer += padded_reclen;
     }
 
     t->iocbs = malloc(sizeof(struct iocb *) * max_io_submit);
@@ -996,8 +972,6 @@ int setup_shared_mem(int num_threads, int num_files, int depth,
     padded_reclen = (reclen + page_size_mask) / (page_size_mask+1);
     padded_reclen = padded_reclen * (page_size_mask+1);
     total_ram = num_files * depth * padded_reclen;
-    if (verify)
-        total_ram += padded_reclen * num_files;
 
     if (use_shm == USE_MALLOC) {
         p = malloc(total_ram + page_size_mask);
@@ -1263,30 +1237,23 @@ off_t parse_size(char *size_arg, off_t mult) {
 }
 
 void print_usage(void) {
-    printf("usage: b2b [-s size] [-r size] [-a size] [-d num] [-b num]\n");
-    printf("                  [-i num] [-t num] [-c num] [-C size] [-nxhOS ]\n");
-    printf("                  file1 [file2 ...]\n");
+    printf("usage: b2b [-r size] [-a size] [-d num] [-i num]\n");
+    printf("           [-c num] [-O 0|1][-nhS ] file1 file2\n");
     printf("\t-a size in KB at which to align buffers\n");
-    printf("\t-b max number of iocbs to give io_submit at once\n");
     printf("\t-c number of io contexts per file\n");
-    printf("\t-s size in MB of the test file(s), default 1024MB\n");
-    printf("\t-r record size in KB used for each io, default 64KB\n");
-    printf("\t-d number of pending aio requests for each file, default 64\n");
-    printf("\t-i number of ios per file sent before switching\n\t   to the next file, default 8\n");
-    printf("\t-I total number of ayncs IOs the program will run, default is run until Cntl-C\n");
-    printf("\t-O Use O_DIRECT (not available in 2.4 kernels),\n");
+    printf("\t-r record size in KB used for each io, default 1MB\n");
+    printf("\t-d number of pending aio requests for each file, default 32\n");
+    printf("\t-i number of ios per file sent per round, default 8\n");
+    printf("\t-I total number of ayncs IOs the program will run, default is run until finish\n");
+    printf("\t-O 1, use O_DIRECT, 0, use BUFFER IO\n");
     printf("\t-S Use O_SYNC for writes\n");
-    printf("\t   repeat -o to specify multiple ops: -o 0 -o 1 etc.\n");
     printf("\t-m shm use ipc shared memory for io buffers instead of malloc\n");
     printf("\t-m shmfs mmap a file in /dev/shm for io buffers\n");
-    printf("\t-n no fsyncs between write stage and read stage\n");
+    printf("\t-n no fsyncs before exit\n");
     printf("\t-l print io_submit latencies after each stage\n");
     printf("\t-L print io completion latencies after each stage\n");
-    printf("\t-t number of threads to run\n");
-    printf("\t-u unlink files after completion\n");
-    printf("\t-v verification of bytes written\n");
     printf("\t-h this message\n");
-    printf("\n\t   the size options (-a -s and -r) allow modifiers -s 400{k,m,g}\n");
+    printf("\n\t   the size options (-a and -r) allow modifiers -s 400{k,m,g}\n");
     printf("\t   translate to 400KB, 400MB and 400GB\n");
     printf("version %s\n", PROG_VERSION);
 }
@@ -1307,9 +1274,7 @@ off_t get_file_size(int fd)
                 "Error while opening %llu : %s\n",
                 filesize, strerror(errno));
             return 0;
-        }
-        //fprintf(stderr, "filesize %llu(%llx) s.st_size:%llx\n", 
-            //filesize, filesize, s.st_size);        
+        }     
     } else if (S_ISREG(s.st_mode)) {
         filesize = s.st_size;
     }
@@ -1332,7 +1297,7 @@ int main(int ac, char **av)
     page_size_mask = getpagesize() - 1;
 
     while(1) {
-        c = getopt(ac, av, "a:b:c:C:m:s:r:d:i:I:t:lLnhOSxvu");
+        c = getopt(ac, av, "a:c:m:r:d:i:I:O:lLnhS");
         if  (c < 0)
             break;
 
@@ -1343,9 +1308,6 @@ int main(int ac, char **av)
             break;
         case 'c':
             num_contexts = atoi(optarg);
-            break;
-        case 'b':
-            max_io_submit = atoi(optarg);
             break;
         case 'd':
             depth = atoi(optarg);
@@ -1377,25 +1339,15 @@ int main(int ac, char **av)
             use_shm = USE_SHMFS;
             }
             break;
-        case 'o': 
-            i = atoi(optarg);
-            stages |= 1 << i;
-            fprintf(stderr, "adding stage %s\n", stage_name(i));
-            break;
         case 'O':
-            o_direct = O_DIRECT;
+            i = atoi(optarg);
+            if (!i)
+                o_direct = 0;
+            else
+                o_direct = O_DIRECT;
             break;
         case 'S':
             o_sync = O_SYNC;
-            break;
-        case 't':
-            num_threads = atoi(optarg);
-            break;
-        case 'u':
-            unlink_files = 1;
-            break;
-        case 'v':
-            verify = 1;
             break;
         case 'h':
         default:
@@ -1430,29 +1382,16 @@ int main(int ac, char **av)
         perror("malloc");
         exit(1);
     }
-    global_thread_info = t;
-
-    /* by default, allow a huge number of iocbs to be sent towards
-     * io_submit
-     */
-    if (!max_io_submit)
-        max_io_submit = io_iter;
-
-    /*
-     * make sure we don't try to submit more ios than max_io_submit allows 
-     */
-    if (max_io_submit < io_iter) {
-        io_iter = max_io_submit;
-        fprintf(stderr, "dropping io_iter to %d\n", io_iter);
-    }
-
+    global_thread_info = t;   
+    max_io_submit = depth;
+    
     stages = READ;    
 
     fprintf(stderr, "record size %luKB, depth %d, ios per iteration %d\n", rec_len / 1024, depth, io_iter);
     fprintf(stderr, "max io_submit %d, buffer alignment set to %luKB\n", 
             max_io_submit, (page_size_mask + 1)/1024);
-    fprintf(stderr, "threads %d files %d contexts %d verification %s\n", 
-            num_threads, num_files, num_contexts, verify ? "on" : "off");
+    fprintf(stderr, "threads %d files %d contexts %d\n", 
+            num_threads, num_files, num_contexts);
     /* open all the files and do any required setup for them */
     for (i = optind ; i < ac ; i = i + 2) {
         for (j = 0 ; j < num_contexts ; j++) {
@@ -1535,13 +1474,6 @@ int main(int ac, char **av)
     } else {
         printf("Running single thread version \n");
         status = worker(t);
-    }
-    if (unlink_files) {
-        for (i = optind ; i < ac ; i = i + 2) {
-            printf("Cleaning up file %s \n", av[i], av[i+1]);
-            unlink(av[i]);
-            unlink(av[i+1]);
-        }
     }
 
     if (status) {
