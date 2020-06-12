@@ -412,13 +412,15 @@ static void print_lat(char *str, struct io_latency *lat) {
 static void print_latency(struct thread_info *t)
 {
     struct io_latency *lat = &t->io_submit_latency;
-    print_lat("latency", lat);
+    fprintf(stderr, "thread %d", gettidv1());
+    print_lat(" io submit latency", lat);
 }
 
 static void print_completion_latency(struct thread_info *t)
 {
     struct io_latency *lat = &t->io_completion_latency;
-    print_lat("completion latency", lat);
+    fprintf(stderr, "thread %d", gettidv1());
+    print_lat(" io completion latency", lat);
 }
 
 /*
